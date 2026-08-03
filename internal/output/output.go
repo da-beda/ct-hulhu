@@ -78,11 +78,9 @@ func (w *Writer) writeUnique(prefix string, items []string, sanitize bool) {
 		if _, exists := w.seen[key]; exists {
 			continue
 		}
+		w.checkDedupLimit()
 		if len(w.seen) < maxDedup {
 			w.seen[key] = struct{}{}
-		} else if !w.dedupWarned {
-			w.dedupWarned = true
-			fmt.Fprintf(os.Stderr, "[WRN] deduplication limit reached (%d entries), duplicates may appear in output\n", maxDedup)
 		}
 		if sanitize {
 			item = Sanitize(item)
