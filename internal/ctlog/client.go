@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -17,7 +18,7 @@ type Client struct {
 }
 
 func NewClient(baseURL string, timeout time.Duration, retries int) *Client {
-	if len(baseURL) > 0 && baseURL[len(baseURL)-1] != '/' {
+	if baseURL != "" && !strings.HasSuffix(baseURL, "/") {
 		baseURL += "/"
 	}
 	return &Client{
