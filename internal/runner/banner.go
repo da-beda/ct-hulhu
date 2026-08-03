@@ -21,11 +21,11 @@ var version = ""
 func getVersion() string {
 	v := version
 	if v == "" {
-		if info, ok := debug.ReadBuildInfo(); ok && info.Main.Version != "" && info.Main.Version != "(devel)" {
-			v = info.Main.Version
-		} else {
+		info, ok := debug.ReadBuildInfo()
+		if !ok || info.Main.Version == "" || info.Main.Version == "(devel)" {
 			return "dev"
 		}
+		v = info.Main.Version
 	}
 	return strings.TrimPrefix(v, "v")
 }
