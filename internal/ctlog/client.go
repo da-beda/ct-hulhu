@@ -44,8 +44,8 @@ func (c *Client) GetSTH(ctx context.Context) (*STH, error) {
 	}
 
 	var sth STH
-	if err := json.Unmarshal(body, &sth); err != nil {
-		return nil, fmt.Errorf("parsing STH: %w", err)
+	if err := parseJSON(body, &sth, "STH"); err != nil {
+		return nil, err
 	}
 	return &sth, nil
 }
@@ -59,10 +59,18 @@ func (c *Client) GetRawEntries(ctx context.Context, start, end int64) (*GetEntri
 	}
 
 	var resp GetEntriesResponse
-	if err := json.Unmarshal(body, &resp); err != nil {
-		return nil, fmt.Errorf("parsing entries [%d-%d]: %w", start, end, err)
+	if err := parseJSON(body, &resp, fmt.Sprintf("entries [%d-%d]", start, end)); err != nil {
+		return nil, err
 	}
 	return &resp, nil
+}
+
+func parseJSON(body []byte, target any, subject string) error {
+	if err := json.Unmarshal(body, target); err != nil {
+		return fmt.Errorf("parsing %s: %w", subject, err)
+	}
+
+	return nil
 }
 
 func (c *Client) doRequestWithRetry(ctx context.Context, url string) ([]byte, error) {
