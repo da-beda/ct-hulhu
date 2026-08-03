@@ -3,8 +3,10 @@ package output
 import (
 	"bytes"
 	"encoding/json"
+	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -233,6 +235,50 @@ func TestWriter_FlushOnClose(t *testing.T) {
 	if !bytes.Contains(data, []byte("example.com")) {
 		t.Error("expected flushed data after Close")
 	}
+}
+
+func TestWriter_CheckDedupLimit_WarnsAtMaxOnce(t *testing.T) {
+	w := &Writer{seen: make(map[string]struct{}, maxDedup)}
+	for i := 0; i < maxDedup; i++ {
+		w.seen[strconv.Itoa(i)] = struct{}{}
+	}
+
+	warn := captureStderr(t, func() {
+		w.checkDedupLimit()
+		w.checkDedupLimit()
+	})
+
+	if !w.dedupWarned {
+		t.Fatal("expected dedupWarned to be true after limit warning")
+	}
+
+	if strings.Count(warn, "deduplication limit reached") != 1 {
+		t.Fatalf("expected exactly one dedup warning, got output: %q", warn)
+	}
+}
+
+func captureStderr(t *testing.T, fn func()) string {
+	t.Helper()
+
+	old := os.Stderr
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("creating stderr pipe: %v", err)
+	}
+	os.Stderr = w
+
+	fn()
+
+	_ = w.Close()
+	os.Stderr = old
+
+	b, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatalf("reading captured stderr: %v", err)
+	}
+	_ = r.Close()
+
+	return string(b)
 }
 
 func nonEmptyLines(s string) []string {
