@@ -89,10 +89,10 @@ func IsNewer(current, remote string) bool {
 	rem := parseVersion(remote)
 
 	for i := 0; i < 3; i++ {
-		if rem[i] > cur[i] {
+		switch {
+		case rem[i] > cur[i]:
 			return true
-		}
-		if rem[i] < cur[i] {
+		case rem[i] < cur[i]:
 			return false
 		}
 	}
