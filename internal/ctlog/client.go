@@ -78,17 +78,8 @@ func (c *Client) doRequestWithRetry(ctx context.Context, url string) ([]byte, er
 	var lastErr error
 
 	for attempt := 0; attempt <= c.retries; attempt++ {
-		if attempt > 0 {
-			backoff := time.Duration(1<<uint(attempt-1)) * time.Second
-
-			if backoff > 30*time.Second {
-				backoff = 30 * time.Second
-			}
-			select {
-			case <-ctx.Done():
-				return nil, ctx.Err()
-			case <-time.After(backoff):
-			}
+		if err := waitForRetryBackoff(ctx, attempt); err != nil {
+			return nil, err
 		}
 
 		body, err := c.doRequest(ctx, url)
@@ -99,6 +90,24 @@ func (c *Client) doRequestWithRetry(ctx context.Context, url string) ([]byte, er
 	}
 
 	return nil, fmt.Errorf("all %d retries exhausted: %w", c.retries, lastErr)
+}
+
+func waitForRetryBackoff(ctx context.Context, attempt int) error {
+	if attempt <= 0 {
+		return nil
+	}
+
+	backoff := time.Duration(1<<uint(attempt-1)) * time.Second
+	if backoff > 30*time.Second {
+		backoff = 30 * time.Second
+	}
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(backoff):
+		return nil
+	}
 }
 
 const maxResponseSize = 64 << 20
