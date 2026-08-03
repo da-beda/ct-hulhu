@@ -215,6 +215,27 @@ func TestIsNewer_DevVersion(t *testing.T) {
 	}
 }
 
+func TestIsNewer_EqualVersionsMixedPrefixes(t *testing.T) {
+	tests := []struct {
+		name    string
+		current string
+		remote  string
+	}{
+		{name: "both bare", current: "1.2.3", remote: "1.2.3"},
+		{name: "current v prefixed", current: "v1.2.3", remote: "1.2.3"},
+		{name: "remote v prefixed", current: "1.2.3", remote: "v1.2.3"},
+		{name: "both v prefixed", current: "v1.2.3", remote: "v1.2.3"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if IsNewer(tt.current, tt.remote) {
+				t.Errorf("IsNewer(%q, %q) = true, want false", tt.current, tt.remote)
+			}
+		})
+	}
+}
+
 func TestParseVersion_Edge(t *testing.T) {
 	v := parseVersion("v1.2.3-rc1")
 	if v[0] != 1 || v[1] != 2 {
