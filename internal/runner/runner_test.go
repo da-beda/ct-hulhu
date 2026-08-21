@@ -1,6 +1,8 @@
 package runner
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -24,7 +26,20 @@ func TestCalculateRange(t *testing.T) {
 	for _,tt:=range tests{t.Run(tt.name,func(t *testing.T){r:=&Runner{opts:&tt.opts};start,end:=r.calculateRange(tt.treeSize);if start!=tt.wantStart||end!=tt.wantEnd{t.Fatalf("got (%d,%d), want (%d,%d)",start,end,tt.wantStart,tt.wantEnd)}})}
 }
 
-func TestStateFilePath(t *testing.T){r:=&Runner{opts:&Options{StateDir:"/tmp/ct-hulhu"}};got:=r.stateFilePath("https://ct.googleapis.com/logs/us1/argon2025h1/");want:="/tmp/ct-hulhu/ct.googleapis.com_logs_us1_argon2025h1_.state.json";if got!=want{t.Fatalf("got %q want %q",got,want)}}
+func TestStateFilePathsAreDigestBasedAndModeSeparated(t *testing.T){
+	r:=&Runner{opts:&Options{StateDir:"/tmp/ct-hulhu"}}
+	url:="https://ct.googleapis.com/logs/us1/argon2025h1/"
+	digest:=sha256.Sum256([]byte(url));base:=hex.EncodeToString(digest[:])
+	if got,want:=r.stateFilePath(url),filepath.Join("/tmp/ct-hulhu",base+".scrape.state.json");got!=want{t.Fatalf("scrape state path=%q want=%q",got,want)}
+	if got,want:=r.monitorStateFilePath(url),filepath.Join("/tmp/ct-hulhu",base+".monitor.state.json");got!=want{t.Fatalf("monitor state path=%q want=%q",got,want)}
+	if r.stateFilePath(url)==r.monitorStateFilePath(url){t.Fatal("scrape and monitor state paths must differ")}
+}
+
+func TestStateDigestAvoidsSanitizedURLCollision(t *testing.T){
+	a:="https://example.com/a_b/"
+	b:="https://example.com/a/b/"
+	if stateDigest(a)==stateDigest(b){t.Fatal("distinct URLs collided in state digest")}
+}
 
 func TestTruncate(t *testing.T){tests:=[]struct{in string;n int;want string}{{"short",10,"short"},{"exactly10!",10,"exactly10!"},{"this is way too long",10,"this is .."},{"abc",1,"a"},{"abc",0,""},{"abc",2,"ab"}};for _,tt:=range tests{if got:=truncate(tt.in,tt.n);got!=tt.want{t.Errorf("truncate(%q,%d)=%q want %q",tt.in,tt.n,got,tt.want)}}}
 
@@ -39,6 +54,16 @@ func TestLoadSaveProgressV2(t *testing.T){
 	p,err=r.loadProgress(url);if err!=nil{t.Fatal(err)}
 	if p==nil||p.Version!=2||p.Protocol!=ctlog.ProtocolRFC6962||p.LogID!="id"||p.RangeStart!=1000||p.RangeEnd!=60000||p.NextIndex!=50001||p.LastIndex!=50000||p.EntriesDone!=49001{t.Fatalf("unexpected progress: %#v",p)}
 	if got,ok:=p.SafeResumeIndex(1000,60000);!ok||got!=50001{t.Fatalf("resume got=%d ok=%v",got,ok)}
+}
+
+func TestMonitorStateIsIndependentAndPrivate(t *testing.T){
+	dir:=t.TempDir();r:=&Runner{opts:&Options{StateDir:dir}};source:=ctlog.EntrySource{Protocol:ctlog.ProtocolStaticCT,LogID:"id",LogURL:"https://monitor.example/",Verified:true}
+	head:=&ctlog.TreeHead{TreeSize:120,RootHash:make([]byte,32),Verified:true}
+	if err:=r.saveMonitorProgress(source,head,100,120);err!=nil{t.Fatal(err)}
+	p,err:=r.loadMonitorProgress(source.LogURL);if err!=nil{t.Fatal(err)}
+	if p==nil||p.RangeStart!=100||p.NextIndex!=120||p.TreeSize!=120||!p.Verified{t.Fatalf("unexpected monitor progress: %#v",p)}
+	if scrape,err:=r.loadProgress(source.LogURL);err!=nil||scrape!=nil{t.Fatalf("monitor state leaked into scrape state: %#v err=%v",scrape,err)}
+	info,err:=os.Stat(r.monitorStateFilePath(source.LogURL));if err!=nil{t.Fatal(err)};if info.Mode().Perm()&0o077!=0{t.Fatalf("monitor state mode=%o",info.Mode().Perm())}
 }
 
 func TestLoadProgress_CorruptFileFailsClosed(t *testing.T){dir:=t.TempDir();r:=&Runner{opts:&Options{StateDir:dir}};url:="https://ct.example.com/log/";path:=r.stateFilePath(url);if err:=os.WriteFile(path,[]byte("not json"),0o600);err!=nil{t.Fatal(err)};if p,err:=r.loadProgress(url);err==nil||p!=nil{t.Fatalf("expected corrupt state error, p=%#v err=%v",p,err)}}
