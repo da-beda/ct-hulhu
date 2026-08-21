@@ -47,9 +47,11 @@ func (p *Parser) ParseEntryFromSource(entry ctlog.RawEntry, index int64, source 
 	if err != nil {
 		return nil, fmt.Errorf("decoding leaf_input: %w", err)
 	}
-	if len(p.domainFilter) > 0 && !p.rawBytesMatchDomain(leafBytes) {
-		return nil, nil
-	}
+
+	// Deliberately do not reject entries through the historical raw-DER string
+	// prefilter. A malformed/adversarial certificate may still be a relevant CT
+	// observation and must reach the parser so the runner can preserve it as a
+	// malformed event instead of silently dropping it.
 	certInfo, err := p.parseMerkleTreeLeaf(leafBytes, entry.ExtraData)
 	if err != nil {
 		return nil, err
@@ -67,6 +69,8 @@ func (p *Parser) ParseEntryFromSource(entry ctlog.RawEntry, index int64, source 
 	return result, nil
 }
 
+// rawBytesMatchDomain remains as a benchmarkable helper, but is no longer used
+// as a correctness gate before X.509 parsing.
 func (p *Parser) rawBytesMatchDomain(data []byte) bool {
 	for _, domainBytes := range p.domainFilterBytes {
 		if containsFoldASCII(data, domainBytes) {
