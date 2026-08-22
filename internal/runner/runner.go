@@ -8,7 +8,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"maps"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -102,7 +101,9 @@ func (r *Runner) newReader(d loglist.Descriptor) (ctlog.Reader, error) {
 	timeout := time.Duration(r.opts.Timeout) * time.Second
 	switch d.Protocol {
 	case ctlog.ProtocolRFC6962:
-		return ctlog.NewClientWithLogID(d.URL, d.LogID, timeout, r.opts.Retries), nil
+		client := ctlog.NewClientWithLogID(d.URL, d.LogID, timeout, r.opts.Retries)
+		client.SetRequestRateLimit(r.opts.RateLimit)
+		return client, nil
 	case ctlog.ProtocolStaticCT:
 		if strings.TrimSpace(d.Key) == "" {
 			return nil, fmt.Errorf("Static CT log %q has no public key in log-list descriptor", d.Description)
@@ -182,15 +183,15 @@ func (r *Runner) selectionHash(kind string, domains []string) (string, error) {
 		return "", err
 	}
 	binding := struct {
-		Kind          string   `json:"kind"`
-		Domains       []string `json:"domains"`
-		JSON          bool     `json:"json"`
-		Fields        string   `json:"fields"`
-		Output        string   `json:"output"`
-		Malformed     string   `json:"malformed"`
-		Start         int64    `json:"start"`
-		Count         int64    `json:"count"`
-		FromEnd       bool     `json:"from_end"`
+		Kind      string   `json:"kind"`
+		Domains   []string `json:"domains"`
+		JSON      bool     `json:"json"`
+		Fields    string   `json:"fields"`
+		Output    string   `json:"output"`
+		Malformed string   `json:"malformed"`
+		Start     int64    `json:"start"`
+		Count     int64    `json:"count"`
+		FromEnd   bool     `json:"from_end"`
 	}{
 		Kind:      kind,
 		Domains:   normalizeSelectionDomains(domains),
@@ -668,8 +669,6 @@ func (r *Runner) monitor(ctx context.Context) (retErr error) {
 		group.Wait()
 	}
 
-	// Immediately replay any downtime gap represented by persisted monitor
-	// state before waiting for the first poll interval.
 	poll()
 	ticker := time.NewTicker(time.Duration(r.opts.PollInterval) * time.Second)
 	defer ticker.Stop()
