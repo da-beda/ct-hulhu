@@ -114,7 +114,7 @@ func ParseOptions() *Options {
 
 	flag.Usage = func() {
 		showBanner()
-		fmt.Fprintln(os.Stderr, "Usage:\n  ct-hulhu [flags]\n\nAuto-discovery includes RFC6962 and Static CT logs. -lu is RFC6962-only.\n")
+		fmt.Fprint(os.Stderr, "Usage:\n  ct-hulhu [flags]\n\nAuto-discovery includes RFC6962 and Static CT logs. -lu is RFC6962-only.\n\n")
 		printFlags()
 	}
 	flag.Parse()
