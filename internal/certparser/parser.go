@@ -28,12 +28,29 @@ type MalformedEntryError struct {
 func (e *MalformedEntryError) Error() string { return fmt.Sprintf("malformed %s: %v", e.Kind, e.Err) }
 func (e *MalformedEntryError) Unwrap() error { return e.Err }
 
+func normalizeFilterDomain(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	value = strings.TrimSuffix(value, ".")
+	value = strings.TrimPrefix(value, ".")
+	value = strings.TrimPrefix(value, "*.")
+	return value
+}
+
 func New(domains []string) *Parser {
-	lower := make([]string, len(domains))
-	lowerBytes := make([][]byte, len(domains))
-	for i, d := range domains {
-		lower[i] = strings.ToLower(strings.TrimPrefix(strings.TrimSpace(d), "."))
-		lowerBytes[i] = []byte(lower[i])
+	lower := make([]string, 0, len(domains))
+	lowerBytes := make([][]byte, 0, len(domains))
+	seen := make(map[string]struct{}, len(domains))
+	for _, domain := range domains {
+		domain = normalizeFilterDomain(domain)
+		if domain == "" {
+			continue
+		}
+		if _, exists := seen[domain]; exists {
+			continue
+		}
+		seen[domain] = struct{}{}
+		lower = append(lower, domain)
+		lowerBytes = append(lowerBytes, []byte(domain))
 	}
 	return &Parser{domainFilter: lower, domainFilterBytes: lowerBytes}
 }
@@ -218,8 +235,8 @@ func (p *Parser) buildResult(info *ctlog.CertInfo, source ctlog.EntrySource) *ct
 		domainSet[strings.ToLower(name)] = struct{}{}
 	}
 	domains := make([]string, 0, len(domainSet))
-	for d := range domainSet {
-		domains = append(domains, d)
+	for domain := range domainSet {
+		domains = append(domains, domain)
 	}
 	sort.Strings(domains)
 
