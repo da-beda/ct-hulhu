@@ -28,12 +28,29 @@ type MalformedEntryError struct {
 func (e *MalformedEntryError) Error() string { return fmt.Sprintf("malformed %s: %v", e.Kind, e.Err) }
 func (e *MalformedEntryError) Unwrap() error { return e.Err }
 
+func normalizeFilterDomain(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	value = strings.TrimSuffix(value, ".")
+	value = strings.TrimPrefix(value, ".")
+	value = strings.TrimPrefix(value, "*.")
+	return value
+}
+
 func New(domains []string) *Parser {
-	lower := make([]string, len(domains))
-	lowerBytes := make([][]byte, len(domains))
-	for i, d := range domains {
-		lower[i] = strings.ToLower(strings.TrimPrefix(strings.TrimSpace(d), "."))
-		lowerBytes[i] = []byte(lower[i])
+	lower := make([]string, 0, len(domains))
+	lowerBytes := make([][]byte, 0, len(domains))
+	seen := make(map[string]struct{}, len(domains))
+	for _, domain := range domains {
+		domain = normalizeFilterDomain(domain)
+		if domain == "" {
+			continue
+		}
+		if _, exists := seen[domain]; exists {
+			continue
+		}
+		seen[domain] = struct{}{}
+		lower = append(lower, domain)
+		lowerBytes = append(lowerBytes, []byte(domain))
 	}
 	return &Parser{domainFilter: lower, domainFilterBytes: lowerBytes}
 }
@@ -47,9 +64,12 @@ func (p *Parser) ParseEntryFromSource(entry ctlog.RawEntry, index int64, source 
 	if err != nil {
 		return nil, fmt.Errorf("decoding leaf_input: %w", err)
 	}
-	if len(p.domainFilter) > 0 && !p.rawBytesMatchDomain(leafBytes) {
-		return nil, nil
-	}
+
+	// Do not use the raw-DER substring matcher as an authoritative negative
+	// filter. It is useful as a benchmark/heuristic, but certificate names can
+	// be represented in ways that do not safely preserve the user's literal
+	// filter bytes (for example internationalized names). Parse first and make
+	// the actual X.509 identifiers authoritative.
 	certInfo, err := p.parseMerkleTreeLeaf(leafBytes, entry.ExtraData)
 	if err != nil {
 		return nil, err
@@ -67,6 +87,9 @@ func (p *Parser) ParseEntryFromSource(entry ctlog.RawEntry, index int64, source 
 	return result, nil
 }
 
+// rawBytesMatchDomain remains available for benchmarks and non-authoritative
+// hints. Callers must never treat a false result as proof that an X.509 entry
+// does not contain a matching identifier.
 func (p *Parser) rawBytesMatchDomain(data []byte) bool {
 	for _, domainBytes := range p.domainFilterBytes {
 		if containsFoldASCII(data, domainBytes) {
@@ -212,8 +235,8 @@ func (p *Parser) buildResult(info *ctlog.CertInfo, source ctlog.EntrySource) *ct
 		domainSet[strings.ToLower(name)] = struct{}{}
 	}
 	domains := make([]string, 0, len(domainSet))
-	for d := range domainSet {
-		domains = append(domains, d)
+	for domain := range domainSet {
+		domains = append(domains, domain)
 	}
 	sort.Strings(domains)
 
@@ -245,6 +268,7 @@ func (p *Parser) buildResult(info *ctlog.CertInfo, source ctlog.EntrySource) *ct
 		Protocol:          source.Protocol,
 		LogID:             source.LogID,
 		LogURL:            source.LogURL,
+		Verified:          source.Verified,
 		Serial:            serial,
 		LeafHash:          info.LeafHash,
 		CertificateSHA256: hex.EncodeToString(certHash[:]),

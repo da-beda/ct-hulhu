@@ -150,8 +150,8 @@ func TestSecureClientVerifiesCheckpointAndEntries(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !client.Secure() {
-		t.Fatal("expected secure client")
+	if !client.Secure() || !client.Source().Verified {
+		t.Fatal("expected secure source provenance")
 	}
 	head, err := client.GetTreeHead(t.Context())
 	if err != nil {
@@ -171,8 +171,7 @@ func TestSecureClientVerifiesCheckpointAndEntries(t *testing.T) {
 
 func TestSecureClientRejectsTamperedDataTile(t *testing.T) {
 	key := newTestLogKey(t)
-	originalTile, hashes := tileAndHashes(t, []byte{1}, []byte{2})
-	_, _ = originalTile, hashes
+	_, hashes := tileAndHashes(t, []byte{1}, []byte{2})
 	root := testMerkleRoot(hashes)
 	hashTile := hashTileBytes(hashes)
 	tamperedTile, _ := tileAndHashes(t, []byte{9}, []byte{2})
@@ -284,8 +283,6 @@ func TestSecureClientEnforcesAppendOnlyCheckpointGrowth(t *testing.T) {
 		t.Fatalf("valid append-only growth rejected: %v", err)
 	}
 
-	// Use a fresh client so its previous checkpoint is the original 2-entry
-	// tree, then present a signed but rewritten 3-entry tree.
 	client2, err := NewClientWithKey(server.URL+"/s/", server.URL+"/m/", key.logID, key.keyB64, 5*time.Second, 0)
 	if err != nil {
 		t.Fatal(err)
@@ -298,5 +295,109 @@ func TestSecureClientEnforcesAppendOnlyCheckpointGrowth(t *testing.T) {
 	generation.Store(1)
 	if _, err := client2.GetTreeHead(t.Context()); err == nil {
 		t.Fatal("expected rewritten prefix to fail append-only consistency")
+	}
+}
+
+func TestSeedConsistencyAnchorSurvivesProcessRestart(t *testing.T) {
+	key := newTestLogKey(t)
+	_, firstHashes := tileAndHashes(t, []byte{1}, []byte{2})
+	firstRoot := testMerkleRoot(firstHashes)
+	_, nextHashes := tileAndHashes(t, []byte{1}, []byte{2}, []byte{3})
+	nextRoot := testMerkleRoot(nextHashes)
+
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/m/checkpoint":
+			_, _ = w.Write(buildSignedCheckpoint(t, key, server.URL+"/s/", 3, nextRoot, 2))
+		case "/m/tile/0/000.p/3":
+			_, _ = w.Write(hashTileBytes(nextHashes))
+		case "/m/tile/0/000.p/2":
+			_, _ = w.Write(hashTileBytes(firstHashes))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	client, err := NewClientWithKey(server.URL+"/s/", server.URL+"/m/", key.logID, key.keyB64, 5*time.Second, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := client.SeedConsistencyAnchor(2, firstRoot[:]); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.GetTreeHead(t.Context()); err != nil {
+		t.Fatalf("persisted append-only anchor rejected valid growth: %v", err)
+	}
+
+	badClient, err := NewClientWithKey(server.URL+"/s/", server.URL+"/m/", key.logID, key.keyB64, 5*time.Second, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	badRoot := firstRoot
+	badRoot[0] ^= 0xff
+	if err := badClient.SeedConsistencyAnchor(2, badRoot[:]); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := badClient.GetTreeHead(t.Context()); err == nil {
+		t.Fatal("expected mismatched persisted root to fail consistency verification")
+	}
+}
+
+func TestDataTilePartialFallsBackToFullTile(t *testing.T) {
+	payloads := make([][]byte, tileWidth)
+	for i := range payloads {
+		payloads[i] = []byte{byte(i)}
+	}
+	fullTile, _ := tileAndHashes(t, payloads...)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/m/tile/data/000.p/2":
+			http.NotFound(w, r)
+		case "/m/tile/data/000":
+			_, _ = w.Write(fullTile)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	client, err := NewClient(server.URL+"/s/", server.URL+"/m/", base64.StdEncoding.EncodeToString(make([]byte, 32)), 5*time.Second, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.headMu.Lock()
+	client.current = &Checkpoint{TreeSize: 2, RootHash: make([]byte, 32)}
+	client.headMu.Unlock()
+	resp, err := client.GetRawEntries(t.Context(), 0, 1)
+	if err != nil {
+		t.Fatalf("full-tile fallback failed: %v", err)
+	}
+	if len(resp.Entries) != 2 {
+		t.Fatalf("entries=%d, want 2", len(resp.Entries))
+	}
+}
+
+func TestStaticRequestRateLimitCoversUnderlyingRequests(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("ok"))
+	}))
+	defer server.Close()
+	client, err := NewClient(server.URL+"/s/", server.URL+"/m/", base64.StdEncoding.EncodeToString(make([]byte, 32)), time.Second, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.SetRequestRateLimit(10)
+	started := time.Now()
+	if _, err := client.get(t.Context(), server.URL+"/one"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.get(t.Context(), server.URL+"/two"); err != nil {
+		t.Fatal(err)
+	}
+	if elapsed := time.Since(started); elapsed < 75*time.Millisecond {
+		t.Fatalf("underlying requests were not rate limited; elapsed=%v", elapsed)
 	}
 }

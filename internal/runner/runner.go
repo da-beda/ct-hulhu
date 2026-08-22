@@ -3,15 +3,16 @@ package runner
 import (
 	"bufio"
 	"context"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"maps"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -19,6 +20,7 @@ import (
 
 	"github.com/TheArqsz/ct-hulhu/internal/certparser"
 	"github.com/TheArqsz/ct-hulhu/internal/ctlog"
+	"github.com/TheArqsz/ct-hulhu/internal/evidence"
 	"github.com/TheArqsz/ct-hulhu/internal/loglist"
 	"github.com/TheArqsz/ct-hulhu/internal/output"
 	"github.com/TheArqsz/ct-hulhu/internal/staticct"
@@ -99,12 +101,14 @@ func (r *Runner) newReader(d loglist.Descriptor) (ctlog.Reader, error) {
 	timeout := time.Duration(r.opts.Timeout) * time.Second
 	switch d.Protocol {
 	case ctlog.ProtocolRFC6962:
-		return ctlog.NewClientWithLogID(d.URL, d.LogID, timeout, r.opts.Retries), nil
+		client := ctlog.NewClientWithLogID(d.URL, d.LogID, timeout, r.opts.Retries)
+		client.SetRequestRateLimit(r.opts.RateLimit)
+		return client, nil
 	case ctlog.ProtocolStaticCT:
 		if strings.TrimSpace(d.Key) == "" {
 			return nil, fmt.Errorf("Static CT log %q has no public key in log-list descriptor", d.Description)
 		}
-		return staticct.NewClientWithKey(
+		client, err := staticct.NewClientWithKey(
 			d.SubmissionURL,
 			d.MonitoringURL,
 			d.LogID,
@@ -112,13 +116,125 @@ func (r *Runner) newReader(d loglist.Descriptor) (ctlog.Reader, error) {
 			timeout,
 			r.opts.Retries,
 		)
+		if err != nil {
+			return nil, err
+		}
+		client.SetRequestRateLimit(r.opts.RateLimit)
+		return client, nil
 	default:
 		return nil, fmt.Errorf("unsupported CT protocol %q", d.Protocol)
 	}
 }
 
+func (r *Runner) workerRate(reader ctlog.Reader) int {
+	if reader.Protocol() == ctlog.ProtocolStaticCT {
+		// Static CT performs several HTTP requests per logical entry range
+		// (checkpoint/data/hash tiles), so the client itself owns the true
+		// per-request rate limit.
+		return 0
+	}
+	return r.opts.RateLimit
+}
+
+func (r *Runner) malformedPath() string {
+	if r.opts.MalformedOutput != "" {
+		return r.opts.MalformedOutput
+	}
+	if r.opts.Output != "" {
+		return r.opts.Output + ".malformed.jsonl"
+	}
+	return filepath.Join(r.opts.StateDir, "malformed.jsonl")
+}
+
+func canonicalSelectionPath(path, emptyMarker string) (string, error) {
+	if path == "" {
+		return emptyMarker, nil
+	}
+	absolute, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Clean(absolute), nil
+}
+
+func normalizeSelectionDomains(domains []string) []string {
+	seen := make(map[string]struct{}, len(domains))
+	for _, domain := range domains {
+		domain = strings.ToLower(strings.TrimPrefix(strings.TrimSpace(domain), "."))
+		if domain != "" {
+			seen[domain] = struct{}{}
+		}
+	}
+	out := make([]string, 0, len(seen))
+	for domain := range seen {
+		out = append(out, domain)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func (r *Runner) selectionHash(kind string, domains []string) (string, error) {
+	outputPath, err := canonicalSelectionPath(r.opts.Output, "<stdout>")
+	if err != nil {
+		return "", err
+	}
+	malformedPath, err := canonicalSelectionPath(r.malformedPath(), "<none>")
+	if err != nil {
+		return "", err
+	}
+	binding := struct {
+		Kind      string   `json:"kind"`
+		Domains   []string `json:"domains"`
+		JSON      bool     `json:"json"`
+		Fields    string   `json:"fields"`
+		Output    string   `json:"output"`
+		Malformed string   `json:"malformed"`
+		Start     int64    `json:"start"`
+		Count     int64    `json:"count"`
+		FromEnd   bool     `json:"from_end"`
+	}{
+		Kind:      kind,
+		Domains:   normalizeSelectionDomains(domains),
+		JSON:      r.opts.JSON,
+		Fields:    r.opts.Fields,
+		Output:    outputPath,
+		Malformed: malformedPath,
+		Start:     r.opts.Start,
+		Count:     r.opts.Count,
+		FromEnd:   r.opts.FromEnd,
+	}
+	data, err := json.Marshal(binding)
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:]), nil
+}
+
+func (r *Runner) openMalformedWriter() (*evidence.Writer, error) {
+	malformedPath := r.malformedPath()
+	if r.opts.Output != "" {
+		out, err := canonicalSelectionPath(r.opts.Output, "")
+		if err != nil {
+			return nil, err
+		}
+		malformed, err := canonicalSelectionPath(malformedPath, "")
+		if err != nil {
+			return nil, err
+		}
+		if out == malformed {
+			return nil, fmt.Errorf("output and malformed-evidence paths must be distinct")
+		}
+	}
+	return evidence.NewWriter(malformedPath)
+}
+
 func (r *Runner) scrape(ctx context.Context) (retErr error) {
 	domains := r.collectDomains()
+	selectionHash, err := r.selectionHash("scrape", domains)
+	if err != nil {
+		return fmt.Errorf("binding scrape selection: %w", err)
+	}
 	logs, err := r.resolveLogs(ctx)
 	if err != nil {
 		return err
@@ -126,6 +242,7 @@ func (r *Runner) scrape(ctx context.Context) (retErr error) {
 	if len(logs) == 0 {
 		return fmt.Errorf("no CT logs selected")
 	}
+
 	writer, err := output.NewWriterWithOptions(
 		r.opts.Output,
 		r.opts.JSON,
@@ -141,6 +258,16 @@ func (r *Runner) scrape(ctx context.Context) (retErr error) {
 		}
 	}()
 
+	malformed, err := r.openMalformedWriter()
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err := malformed.Close(); err != nil {
+			retErr = errors.Join(retErr, fmt.Errorf("closing malformed evidence: %w", err))
+		}
+	}()
+
 	parser := certparser.New(domains)
 	if len(domains) > 0 {
 		log.Info("filtering for domains: %s", strings.Join(domains, ", "))
@@ -152,7 +279,7 @@ func (r *Runner) scrape(ctx context.Context) (retErr error) {
 		if err := ctx.Err(); err != nil {
 			return errors.Join(err, errors.Join(failures...))
 		}
-		if err := r.scrapeLog(ctx, descriptor, parser, writer); err != nil {
+		if err := r.scrapeLog(ctx, descriptor, parser, writer, malformed, selectionHash); err != nil {
 			wrapped := fmt.Errorf("%s %s: %w", descriptor.Protocol, descriptor.Description, err)
 			failures = append(failures, wrapped)
 			log.Warning("incomplete scrape: %v", wrapped)
@@ -163,6 +290,9 @@ func (r *Runner) scrape(ctx context.Context) (retErr error) {
 	if err := writer.Flush(); err != nil {
 		failures = append(failures, fmt.Errorf("flushing output: %w", err))
 	}
+	if err := malformed.Flush(); err != nil {
+		failures = append(failures, fmt.Errorf("flushing malformed evidence: %w", err))
+	}
 	if len(failures) > 0 {
 		return fmt.Errorf("scrape incomplete: %d/%d logs completed: %w", succeeded, len(logs), errors.Join(failures...))
 	}
@@ -170,18 +300,56 @@ func (r *Runner) scrape(ctx context.Context) (retErr error) {
 	return nil
 }
 
+type consistencySeeder interface {
+	SeedConsistencyAnchor(treeSize int64, rootHash []byte) error
+}
+
+func seedConsistency(reader ctlog.Reader, treeSize int64, rootHash string) error {
+	if !reader.Source().Verified {
+		return nil
+	}
+	seeder, ok := reader.(consistencySeeder)
+	if !ok {
+		return fmt.Errorf("verified reader %T cannot restore a consistency anchor", reader)
+	}
+	root, err := hex.DecodeString(rootHash)
+	if err != nil {
+		return fmt.Errorf("decoding saved root hash: %w", err)
+	}
+	if len(root) != sha256.Size {
+		return fmt.Errorf("saved root hash has %d bytes, want %d", len(root), sha256.Size)
+	}
+	return seeder.SeedConsistencyAnchor(treeSize, root)
+}
+
 func (r *Runner) scrapeLog(
 	ctx context.Context,
 	descriptor loglist.Descriptor,
 	parser *certparser.Parser,
 	writer *output.Writer,
+	malformed *evidence.Writer,
+	selectionHash string,
 ) error {
 	reader, err := r.newReader(descriptor)
 	if err != nil {
 		return err
 	}
 	source := reader.Source()
-	log.Info("connecting to %s (%s)", source.LogURL, source.Protocol)
+	log.Info("connecting to %s (%s, verified=%v)", source.LogURL, source.Protocol, source.Verified)
+
+	var progress *ctlog.ScrapeProgress
+	if r.opts.Resume {
+		progress, err = r.loadScrapeProgress(source, selectionHash)
+		if err != nil {
+			return fmt.Errorf("loading resume state: %w", err)
+		}
+		if progress != nil && progress.Verified {
+			if err := seedConsistency(reader, progress.TreeSize, progress.RootHash); err != nil {
+				return fmt.Errorf("restoring consistency anchor: %w", err)
+			}
+		}
+	}
+
 	head, err := reader.GetTreeHead(ctx)
 	if err != nil {
 		return fmt.Errorf("getting tree head: %w", err)
@@ -197,37 +365,27 @@ func (r *Runner) scrapeLog(
 	}
 	start := requestedStart
 	proofStart := requestedStart
-	if r.opts.Resume {
-		progress, err := r.loadProgress(source.LogURL)
-		if err != nil {
-			return fmt.Errorf("loading resume state: %w", err)
+	if progress != nil {
+		if progress.TreeSize > treeSize {
+			return fmt.Errorf("saved tree size %d exceeds current tree size %d", progress.TreeSize, treeSize)
 		}
-		if progress != nil {
-			if progress.Protocol != "" && progress.Protocol != source.Protocol {
-				return fmt.Errorf("resume state protocol %q does not match %q", progress.Protocol, source.Protocol)
+		if progress.TreeSize == treeSize && progress.RootHash != "" && progress.RootHash != rootHash {
+			return fmt.Errorf("same-size current tree root disagrees with saved state")
+		}
+		if next, ok := progress.SafeResumeIndex(requestedStart, end); ok {
+			start = next
+			proofStart = progress.RangeStart
+			if start >= end {
+				return nil
 			}
-			if progress.LogID != "" && source.LogID != "" && progress.LogID != source.LogID {
-				return fmt.Errorf("resume state log ID does not match selected log")
-			}
-			if next, ok := progress.SafeResumeIndex(requestedStart, end); ok {
-				start = next
-				if progress.Version >= 2 {
-					proofStart = progress.RangeStart
-				} else {
-					proofStart = 0
-				}
-				if start >= end {
-					return nil
-				}
-				log.Info("resuming from entry %d", start)
-			} else {
-				log.Info("saved state does not prove requested range prefix; starting at %d", requestedStart)
-			}
+			log.Info("resuming from entry %d", start)
+		} else {
+			log.Info("saved state does not prove requested range prefix; starting at %d", requestedStart)
 		}
 	}
 
 	total := end - start
-	pool := ctlog.NewWorkerPool(reader, r.opts.BatchSize, r.opts.Workers, r.opts.RateLimit)
+	pool := ctlog.NewWorkerPool(reader, r.opts.BatchSize, r.opts.Workers, r.workerRate(reader))
 	pool.SetDebugLog(log.Debug)
 	results := make(chan ctlog.EntryBatch, r.opts.Workers*2)
 	fetchErr := make(chan error, 1)
@@ -245,21 +403,28 @@ func (r *Runner) scrapeLog(
 	lastSaved := start
 	for batch := range results {
 		batchEnd := batch.StartIndex + int64(len(batch.Entries))
-		parseErr := r.parseBatch(batch, parser, writer, source, parseSem, &attempted)
-		flushErr := writer.Flush()
-		if parseErr != nil || flushErr != nil {
+		malformedWritten, parseErr := r.parseBatch(batch, parser, writer, malformed, source, parseSem, &attempted)
+		outputErr := writer.Flush()
+		var malformedErr error
+		if malformedWritten {
+			malformedErr = malformed.Flush()
+		}
+		if parseErr != nil || outputErr != nil || malformedErr != nil {
 			if parseErr != nil {
 				failures = append(failures, parseErr)
-				log.Warning("not checkpointing batch at %d: %v", batch.StartIndex, parseErr)
 			}
-			if flushErr != nil {
-				failures = append(failures, fmt.Errorf("flushing output: %w", flushErr))
+			if outputErr != nil {
+				failures = append(failures, fmt.Errorf("flushing output: %w", outputErr))
+			}
+			if malformedErr != nil {
+				failures = append(failures, fmt.Errorf("flushing malformed evidence: %w", malformedErr))
 			}
 			continue
 		}
+
 		next := tracker.Mark(batch.StartIndex, batchEnd)
 		if r.opts.Resume && next-lastSaved >= 10000 {
-			if err := r.saveProgress(source, treeSize, rootHash, proofStart, end, next); err != nil {
+			if err := r.saveScrapeProgress(source, selectionHash, treeSize, rootHash, proofStart, end, next); err != nil {
 				failures = append(failures, fmt.Errorf("saving progress: %w", err))
 			} else {
 				lastSaved = next
@@ -277,7 +442,7 @@ func (r *Runner) scrapeLog(
 
 	next := tracker.Next()
 	if r.opts.Resume {
-		if err := r.saveProgress(source, treeSize, rootHash, proofStart, end, next); err != nil {
+		if err := r.saveScrapeProgress(source, selectionHash, treeSize, rootHash, proofStart, end, next); err != nil {
 			failures = append(failures, fmt.Errorf("saving final progress: %w", err))
 		}
 	}
@@ -323,8 +488,19 @@ func (r *Runner) progressReporter(
 	}
 }
 
+type monitorSession struct {
+	reader  ctlog.Reader
+	source  ctlog.EntrySource
+	display string
+	pos     int64
+}
+
 func (r *Runner) monitor(ctx context.Context) (retErr error) {
 	domains := r.collectDomains()
+	selectionHash, err := r.selectionHash("monitor", domains)
+	if err != nil {
+		return fmt.Errorf("binding monitor selection: %w", err)
+	}
 	descriptors, err := r.resolveLogs(ctx)
 	if err != nil {
 		return err
@@ -332,6 +508,7 @@ func (r *Runner) monitor(ctx context.Context) (retErr error) {
 	if len(descriptors) == 0 {
 		return fmt.Errorf("no CT logs selected")
 	}
+
 	writer, err := output.NewWriterWithOptions(
 		r.opts.Output,
 		r.opts.JSON,
@@ -343,15 +520,28 @@ func (r *Runner) monitor(ctx context.Context) (retErr error) {
 	}
 	defer func() {
 		if err := writer.Close(); err != nil {
-			retErr = errors.Join(retErr, err)
+			retErr = errors.Join(retErr, fmt.Errorf("closing output: %w", err))
 		}
 	}()
-	parser := certparser.New(domains)
 
-	var mu sync.Mutex
-	positions := map[string]int64{}
-	readers := map[string]ctlog.Reader{}
-	display := map[string]string{}
+	malformed, err := r.openMalformedWriter()
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err := malformed.Close(); err != nil {
+			retErr = errors.Join(retErr, fmt.Errorf("closing malformed evidence: %w", err))
+		}
+	}()
+
+	parser := certparser.New(domains)
+	if len(domains) > 0 {
+		log.Info("monitoring for domains: %s", strings.Join(domains, ", "))
+	}
+
+	var initMu sync.Mutex
+	var initFailures []error
+	sessions := make(map[string]*monitorSession)
 	var initGroup sync.WaitGroup
 	for _, descriptor := range descriptors {
 		descriptor := descriptor
@@ -360,35 +550,83 @@ func (r *Runner) monitor(ctx context.Context) (retErr error) {
 			defer initGroup.Done()
 			reader, err := r.newReader(descriptor)
 			if err != nil {
-				log.Warning("monitor init failed for %s: %v", descriptor.Description, err)
+				initMu.Lock()
+				initFailures = append(initFailures, fmt.Errorf("%s: %w", descriptor.Description, err))
+				initMu.Unlock()
 				return
 			}
+			source := reader.Source()
+
+			var saved *ctlog.MonitorProgress
+			if r.opts.Resume {
+				saved, err = r.loadMonitorProgress(source, selectionHash)
+				if err != nil {
+					initMu.Lock()
+					initFailures = append(initFailures, fmt.Errorf("%s monitor state: %w", descriptor.Description, err))
+					initMu.Unlock()
+					return
+				}
+				if saved != nil && saved.Verified {
+					if err := seedConsistency(reader, saved.TreeSize, saved.RootHash); err != nil {
+						initMu.Lock()
+						initFailures = append(initFailures, fmt.Errorf("%s consistency anchor: %w", descriptor.Description, err))
+						initMu.Unlock()
+						return
+					}
+				}
+			}
+
 			head, err := reader.GetTreeHead(ctx)
 			if err != nil {
-				log.Warning("monitor init failed for %s: %v", descriptor.Description, err)
+				initMu.Lock()
+				initFailures = append(initFailures, fmt.Errorf("%s tree head: %w", descriptor.Description, err))
+				initMu.Unlock()
 				return
 			}
-			id := reader.Source().Identity()
-			mu.Lock()
-			readers[id] = reader
-			positions[id] = head.TreeSize
-			display[id] = descriptor.Description
-			mu.Unlock()
+			position := head.TreeSize
+			if saved != nil {
+				if saved.TreeSize > head.TreeSize {
+					initMu.Lock()
+					initFailures = append(initFailures, fmt.Errorf("%s saved tree size %d exceeds current %d", descriptor.Description, saved.TreeSize, head.TreeSize))
+					initMu.Unlock()
+					return
+				}
+				position = saved.TreeSize
+			} else {
+				if err := r.saveMonitorProgress(source, selectionHash, head); err != nil {
+					initMu.Lock()
+					initFailures = append(initFailures, fmt.Errorf("%s saving initial monitor state: %w", descriptor.Description, err))
+					initMu.Unlock()
+					return
+				}
+			}
+
+			id := source.Identity()
+			initMu.Lock()
+			sessions[id] = &monitorSession{reader: reader, source: source, display: descriptor.Description, pos: position}
+			initMu.Unlock()
 		}()
 	}
 	initGroup.Wait()
-	if len(readers) == 0 {
-		return fmt.Errorf("could not initialize any selected CT logs")
+	if len(initFailures) > 0 {
+		return fmt.Errorf("monitor startup coverage incomplete: %w", errors.Join(initFailures...))
 	}
-	if len(readers) != len(descriptors) {
-		log.Warning("monitor coverage incomplete at startup: %d/%d logs", len(readers), len(descriptors))
+	if len(sessions) != len(descriptors) {
+		return fmt.Errorf("monitor startup coverage mismatch: initialized %d/%d logs", len(sessions), len(descriptors))
 	}
 
+	var sessionsMu sync.Mutex
 	poll := func() {
-		mu.Lock()
-		snapshot := make(map[string]int64, len(positions))
-		maps.Copy(snapshot, positions)
-		mu.Unlock()
+		if ctx.Err() != nil {
+			return
+		}
+		sessionsMu.Lock()
+		snapshot := make(map[string]int64, len(sessions))
+		for id, session := range sessions {
+			snapshot[id] = session.pos
+		}
+		sessionsMu.Unlock()
+
 		sem := make(chan struct{}, r.opts.Workers)
 		var group sync.WaitGroup
 		for id, previous := range snapshot {
@@ -398,26 +636,34 @@ func (r *Runner) monitor(ctx context.Context) (retErr error) {
 			go func() {
 				defer group.Done()
 				defer func() { <-sem }()
-				reader := readers[id]
-				head, err := reader.GetTreeHead(ctx)
+
+				sessionsMu.Lock()
+				session := sessions[id]
+				sessionsMu.Unlock()
+				head, err := session.reader.GetTreeHead(ctx)
 				if err != nil {
-					log.Warning("poll failed for %s; retaining %d: %v", display[id], previous, err)
+					log.Warning("poll failed for %s; retaining %d: %v", session.display, previous, err)
 					return
 				}
 				if head.TreeSize < previous {
-					log.Warning("tree size decreased for %s; retaining %d", display[id], previous)
+					log.Warning("tree size decreased for %s; retaining %d", session.display, previous)
 					return
 				}
 				if head.TreeSize == previous {
 					return
 				}
-				if err := r.fetchAndProcess(ctx, reader, previous, head.TreeSize, parser, writer); err != nil {
-					log.Warning("delta incomplete for %s; retaining %d: %v", display[id], previous, err)
+
+				if err := r.fetchAndProcess(ctx, session.reader, previous, head.TreeSize, parser, writer, malformed); err != nil {
+					log.Warning("delta incomplete for %s; retaining %d: %v", session.display, previous, err)
 					return
 				}
-				mu.Lock()
-				positions[id] = head.TreeSize
-				mu.Unlock()
+				if err := r.saveMonitorProgress(session.source, selectionHash, head); err != nil {
+					log.Warning("could not persist monitor checkpoint for %s; retaining %d: %v", session.display, previous, err)
+					return
+				}
+				sessionsMu.Lock()
+				session.pos = head.TreeSize
+				sessionsMu.Unlock()
 			}()
 		}
 		group.Wait()
@@ -426,7 +672,7 @@ func (r *Runner) monitor(ctx context.Context) (retErr error) {
 	poll()
 	ticker := time.NewTicker(time.Duration(r.opts.PollInterval) * time.Second)
 	defer ticker.Stop()
-	log.Info("monitoring %d log(s)", len(readers))
+	log.Info("monitoring %d log(s)", len(sessions))
 	for {
 		select {
 		case <-ctx.Done():
@@ -443,8 +689,9 @@ func (r *Runner) fetchAndProcess(
 	start, end int64,
 	parser *certparser.Parser,
 	writer *output.Writer,
+	malformed *evidence.Writer,
 ) error {
-	pool := ctlog.NewWorkerPool(reader, r.opts.BatchSize, r.opts.Workers, r.opts.RateLimit)
+	pool := ctlog.NewWorkerPool(reader, r.opts.BatchSize, r.opts.Workers, r.workerRate(reader))
 	results := make(chan ctlog.EntryBatch, r.opts.Workers*2)
 	errCh := make(chan error, 1)
 	go func() { errCh <- pool.FetchRange(ctx, start, end, results) }()
@@ -452,12 +699,22 @@ func (r *Runner) fetchAndProcess(
 	sem := r.newParseSem()
 	var failures []error
 	for batch := range results {
-		if err := r.parseBatch(batch, parser, writer, reader.Source(), sem, nil); err != nil {
-			failures = append(failures, err)
-			continue
+		malformedWritten, parseErr := r.parseBatch(batch, parser, writer, malformed, reader.Source(), sem, nil)
+		outputErr := writer.Flush()
+		var malformedErr error
+		if malformedWritten {
+			malformedErr = malformed.Flush()
 		}
-		if err := writer.Flush(); err != nil {
-			failures = append(failures, err)
+		if parseErr != nil || outputErr != nil || malformedErr != nil {
+			if parseErr != nil {
+				failures = append(failures, parseErr)
+			}
+			if outputErr != nil {
+				failures = append(failures, outputErr)
+			}
+			if malformedErr != nil {
+				failures = append(failures, malformedErr)
+			}
 			continue
 		}
 		tracker.Mark(batch.StartIndex, batch.StartIndex+int64(len(batch.Entries)))
@@ -482,25 +739,27 @@ func (r *Runner) newParseSem() chan struct{} {
 	return make(chan struct{}, n)
 }
 
-type batchParseError struct {
+type batchEvidenceError struct {
 	Count int
 	First []error
 }
 
-func (e *batchParseError) Error() string {
-	return fmt.Sprintf("%d certificate entries failed to parse; first errors: %v", e.Count, e.First)
+func (e *batchEvidenceError) Error() string {
+	return fmt.Sprintf("%d malformed CT entries could not be preserved; first errors: %v", e.Count, e.First)
 }
 
 func (r *Runner) parseBatch(
 	batch ctlog.EntryBatch,
 	parser *certparser.Parser,
 	writer *output.Writer,
+	malformed *evidence.Writer,
 	source ctlog.EntrySource,
 	sem chan struct{},
 	counter *atomic.Int64,
-) error {
+) (bool, error) {
 	var group sync.WaitGroup
 	errs := make(chan error, len(batch.Entries))
+	var malformedWritten atomic.Bool
 	for i, entry := range batch.Entries {
 		i, entry := i, entry
 		group.Add(1)
@@ -514,7 +773,15 @@ func (r *Runner) parseBatch(
 			index := batch.StartIndex + int64(i)
 			result, err := parser.ParseEntryFromSource(entry, index, source)
 			if err != nil {
-				errs <- fmt.Errorf("entry %d: %w", index, err)
+				if malformed == nil {
+					errs <- fmt.Errorf("entry %d: %w", index, err)
+					return
+				}
+				if evidenceErr := malformed.Append(source, index, entry, err); evidenceErr != nil {
+					errs <- fmt.Errorf("entry %d malformed evidence: %w", index, evidenceErr)
+					return
+				}
+				malformedWritten.Store(true)
 				return
 			}
 			if result != nil {
@@ -535,9 +802,9 @@ func (r *Runner) parseBatch(
 		}
 	}
 	if count > 0 {
-		return &batchParseError{Count: count, First: first}
+		return malformedWritten.Load(), &batchEvidenceError{Count: count, First: first}
 	}
-	return nil
+	return malformedWritten.Load(), nil
 }
 
 func (r *Runner) collectDomains() []string {
@@ -557,6 +824,9 @@ func (r *Runner) collectDomains() []string {
 			if value := strings.TrimSpace(scanner.Text()); value != "" {
 				domains = append(domains, value)
 			}
+		}
+		if err := scanner.Err(); err != nil {
+			log.Warning("reading stdin: %v", err)
 		}
 	}
 	return domains
@@ -626,68 +896,32 @@ func (r *Runner) calculateRange(treeSize int64) (start, end int64) {
 	return
 }
 
-func (r *Runner) loadProgress(logURL string) (*ctlog.ScrapeProgress, error) {
-	path := r.stateFilePath(logURL)
-	data, err := os.ReadFile(path)
-	if errors.Is(err, os.ErrNotExist) {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, err
-	}
-	var progress ctlog.ScrapeProgress
-	if err := json.Unmarshal(data, &progress); err != nil {
-		return nil, fmt.Errorf("parsing %s: %w", path, err)
-	}
-	if progress.LogURL != logURL {
-		return nil, fmt.Errorf("state log URL mismatch")
-	}
-	if progress.Version > 2 {
-		return nil, fmt.Errorf("unsupported state version %d", progress.Version)
-	}
-	if progress.Version >= 2 && (
-		progress.RangeStart < 0 ||
-		progress.RangeEnd < progress.RangeStart ||
-		progress.NextIndex < progress.RangeStart ||
-		progress.NextIndex > progress.RangeEnd ||
-		progress.RangeEnd > progress.TreeSize) {
-		return nil, fmt.Errorf("invalid v2 state bounds")
-	}
-	return &progress, nil
+func (r *Runner) statePath(kind string, source ctlog.EntrySource) string {
+	sum := sha256.Sum256([]byte(source.Identity()))
+	return filepath.Join(r.opts.StateDir, fmt.Sprintf("%s-%x.json", kind, sum[:]))
 }
 
-func (r *Runner) saveProgress(
-	source ctlog.EntrySource,
-	treeSize int64,
-	rootHash string,
-	rangeStart, rangeEnd, next int64,
-) error {
-	if next < rangeStart || next > rangeEnd || rangeEnd > treeSize {
-		return fmt.Errorf("invalid progress bounds")
-	}
-	progress := ctlog.ScrapeProgress{
-		Version:     2,
-		Protocol:    source.Protocol,
-		LogID:       source.LogID,
-		LogURL:      source.LogURL,
-		TreeSize:    treeSize,
-		RootHash:    rootHash,
-		RangeStart:  rangeStart,
-		RangeEnd:    rangeEnd,
-		LastIndex:   next - 1,
-		NextIndex:   next,
-		EntriesDone: next - rangeStart,
-		LastUpdated: time.Now().UTC(),
-	}
-	data, err := json.Marshal(progress)
+func (r *Runner) scrapeStatePath(source ctlog.EntrySource) string {
+	return r.statePath("scrape", source)
+}
+
+func (r *Runner) monitorStatePath(source ctlog.EntrySource) string {
+	return r.statePath("monitor", source)
+}
+
+func (r *Runner) atomicWriteJSON(path string, value any) error {
+	data, err := json.Marshal(value)
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(r.opts.StateDir, 0o700); err != nil {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
-	path := r.stateFilePath(source.LogURL)
-	tmp, err := os.CreateTemp(r.opts.StateDir, ".state-*")
+	if err := os.Chmod(dir, 0o700); err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(dir, ".state-*")
 	if err != nil {
 		return err
 	}
@@ -712,6 +946,173 @@ func (r *Runner) saveProgress(
 		return err
 	}
 	return os.Chmod(path, 0o600)
+}
+
+func validateSourceState(source ctlog.EntrySource, protocol ctlog.Protocol, logID, logURL string, verified bool) error {
+	if protocol != source.Protocol {
+		return fmt.Errorf("state protocol %q does not match %q", protocol, source.Protocol)
+	}
+	if logID != source.LogID {
+		return fmt.Errorf("state log ID does not match selected log")
+	}
+	if logURL != source.LogURL {
+		return fmt.Errorf("state log URL does not match selected log")
+	}
+	if verified != source.Verified {
+		return fmt.Errorf("state verification level does not match selected reader")
+	}
+	return nil
+}
+
+func (r *Runner) loadScrapeProgress(source ctlog.EntrySource, selectionHash string) (*ctlog.ScrapeProgress, error) {
+	path := r.scrapeStatePath(source)
+	data, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var progress ctlog.ScrapeProgress
+	if err := json.Unmarshal(data, &progress); err != nil {
+		return nil, fmt.Errorf("parsing %s: %w", path, err)
+	}
+	if progress.Version != 3 {
+		return nil, fmt.Errorf("state %s has unsupported safe-resume version %d; start fresh rather than reusing unbound state", path, progress.Version)
+	}
+	if err := validateSourceState(source, progress.Protocol, progress.LogID, progress.LogURL, progress.Verified); err != nil {
+		return nil, err
+	}
+	if progress.SelectionHash != selectionHash {
+		return nil, fmt.Errorf("saved scrape selection does not match the current domains/output/range semantics")
+	}
+	if progress.RangeStart < 0 || progress.RangeEnd < progress.RangeStart || progress.NextIndex < progress.RangeStart || progress.NextIndex > progress.RangeEnd || progress.RangeEnd > progress.TreeSize {
+		return nil, fmt.Errorf("invalid v3 scrape-state bounds")
+	}
+	return &progress, nil
+}
+
+func (r *Runner) saveScrapeProgress(source ctlog.EntrySource, selectionHash string, treeSize int64, rootHash string, rangeStart, rangeEnd, next int64) error {
+	if next < rangeStart || next > rangeEnd || rangeEnd > treeSize {
+		return fmt.Errorf("invalid progress bounds")
+	}
+	progress := ctlog.ScrapeProgress{
+		Version:       3,
+		Protocol:      source.Protocol,
+		LogID:         source.LogID,
+		LogURL:        source.LogURL,
+		Verified:      source.Verified,
+		SelectionHash: selectionHash,
+		TreeSize:      treeSize,
+		RootHash:      rootHash,
+		RangeStart:    rangeStart,
+		RangeEnd:      rangeEnd,
+		LastIndex:     next - 1,
+		NextIndex:     next,
+		EntriesDone:   next - rangeStart,
+		LastUpdated:   time.Now().UTC(),
+	}
+	return r.atomicWriteJSON(r.scrapeStatePath(source), progress)
+}
+
+func (r *Runner) loadMonitorProgress(source ctlog.EntrySource, selectionHash string) (*ctlog.MonitorProgress, error) {
+	path := r.monitorStatePath(source)
+	data, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var progress ctlog.MonitorProgress
+	if err := json.Unmarshal(data, &progress); err != nil {
+		return nil, fmt.Errorf("parsing %s: %w", path, err)
+	}
+	if progress.Version != 3 {
+		return nil, fmt.Errorf("monitor state %s has unsupported version %d", path, progress.Version)
+	}
+	if err := validateSourceState(source, progress.Protocol, progress.LogID, progress.LogURL, progress.Verified); err != nil {
+		return nil, err
+	}
+	if progress.SelectionHash != selectionHash {
+		return nil, fmt.Errorf("saved monitor selection does not match current domains/output semantics")
+	}
+	if progress.TreeSize < 0 {
+		return nil, fmt.Errorf("saved monitor tree size is negative")
+	}
+	if progress.Verified {
+		root, err := hex.DecodeString(progress.RootHash)
+		if err != nil || len(root) != sha256.Size {
+			return nil, fmt.Errorf("saved verified monitor root is invalid")
+		}
+	}
+	return &progress, nil
+}
+
+func (r *Runner) saveMonitorProgress(source ctlog.EntrySource, selectionHash string, head *ctlog.TreeHead) error {
+	if head == nil || head.TreeSize < 0 || len(head.RootHash) != sha256.Size {
+		return fmt.Errorf("refusing invalid monitor tree head")
+	}
+	progress := ctlog.MonitorProgress{
+		Version:       3,
+		Protocol:      source.Protocol,
+		LogID:         source.LogID,
+		LogURL:        source.LogURL,
+		Verified:      source.Verified,
+		SelectionHash: selectionHash,
+		TreeSize:      head.TreeSize,
+		RootHash:      hex.EncodeToString(head.RootHash),
+		LastUpdated:   time.Now().UTC(),
+	}
+	return r.atomicWriteJSON(r.monitorStatePath(source), progress)
+}
+
+// Legacy v2 helpers are retained for migration/unit-test compatibility only.
+// Runtime resume uses the selection-bound v3 hashed state paths above.
+func (r *Runner) loadProgress(logURL string) (*ctlog.ScrapeProgress, error) {
+	path := r.stateFilePath(logURL)
+	data, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var progress ctlog.ScrapeProgress
+	if err := json.Unmarshal(data, &progress); err != nil {
+		return nil, fmt.Errorf("parsing %s: %w", path, err)
+	}
+	if progress.LogURL != logURL {
+		return nil, fmt.Errorf("state log URL mismatch")
+	}
+	if progress.Version > 2 {
+		return nil, fmt.Errorf("unsupported legacy state version %d", progress.Version)
+	}
+	if progress.Version >= 2 && (progress.RangeStart < 0 || progress.RangeEnd < progress.RangeStart || progress.NextIndex < progress.RangeStart || progress.NextIndex > progress.RangeEnd || progress.RangeEnd > progress.TreeSize) {
+		return nil, fmt.Errorf("invalid v2 state bounds")
+	}
+	return &progress, nil
+}
+
+func (r *Runner) saveProgress(source ctlog.EntrySource, treeSize int64, rootHash string, rangeStart, rangeEnd, next int64) error {
+	if next < rangeStart || next > rangeEnd || rangeEnd > treeSize {
+		return fmt.Errorf("invalid progress bounds")
+	}
+	progress := ctlog.ScrapeProgress{
+		Version:     2,
+		Protocol:    source.Protocol,
+		LogID:       source.LogID,
+		LogURL:      source.LogURL,
+		TreeSize:    treeSize,
+		RootHash:    rootHash,
+		RangeStart:  rangeStart,
+		RangeEnd:    rangeEnd,
+		LastIndex:   next - 1,
+		NextIndex:   next,
+		EntriesDone: next - rangeStart,
+		LastUpdated: time.Now().UTC(),
+	}
+	return r.atomicWriteJSON(r.stateFilePath(source.LogURL), progress)
 }
 
 func (r *Runner) stateFilePath(logURL string) string {

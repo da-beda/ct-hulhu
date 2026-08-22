@@ -13,6 +13,7 @@ type EntrySource struct {
 	Protocol Protocol `json:"protocol"`
 	LogID    string   `json:"log_id,omitempty"`
 	LogURL   string   `json:"log_url"`
+	Verified bool     `json:"verified"`
 }
 
 func (s EntrySource) Identity() string {

@@ -4,6 +4,7 @@ import (
 	"compress/gzip"
 	"context"
 	"crypto"
+	"crypto/sha256"
 	"crypto/tls"
 	"fmt"
 	"io"
@@ -16,7 +17,10 @@ import (
 	"github.com/TheArqsz/ct-hulhu/internal/ctlog"
 )
 
-const maxStaticResponseSize = 64 << 20
+const (
+	maxStaticResponseSize = 64 << 20
+	maxStaticCacheEntries = 4096
+)
 
 type Client struct {
 	submissionURL string
@@ -30,9 +34,15 @@ type Client struct {
 
 	headMu  sync.RWMutex
 	current *Checkpoint
+	anchor  *Checkpoint
 
-	cacheMu sync.RWMutex
-	cache   map[string][]byte
+	cacheMu    sync.RWMutex
+	cache      map[string][]byte
+	cacheOrder []string
+
+	rateMu          sync.Mutex
+	requestInterval time.Duration
+	nextRequest     time.Time
 }
 
 // NewClient creates a structural Static CT reader. It is retained for isolated
@@ -99,6 +109,9 @@ func normalizeURL(raw string) (string, error) {
 	if u.Host == "" {
 		return "", fmt.Errorf("missing host")
 	}
+	if u.User != nil {
+		return "", fmt.Errorf("userinfo is not allowed in CT log URLs")
+	}
 	if u.RawQuery != "" || u.Fragment != "" {
 		return "", fmt.Errorf("query/fragment not allowed")
 	}
@@ -111,9 +124,82 @@ func normalizeURL(raw string) (string, error) {
 
 func (c *Client) Protocol() ctlog.Protocol { return ctlog.ProtocolStaticCT }
 func (c *Client) Source() ctlog.EntrySource {
-	return ctlog.EntrySource{Protocol: ctlog.ProtocolStaticCT, LogID: c.logID, LogURL: c.monitoringURL}
+	return ctlog.EntrySource{
+		Protocol: ctlog.ProtocolStaticCT,
+		LogID:    c.logID,
+		LogURL:   c.monitoringURL,
+		Verified: c.secure,
+	}
 }
 func (c *Client) Secure() bool { return c.secure }
+
+// SetRequestRateLimit caps all Static CT HTTP requests, including checkpoint,
+// data-tile, hash-tile and retry traffic. A value of zero disables the cap.
+func (c *Client) SetRequestRateLimit(requestsPerSecond int) {
+	c.rateMu.Lock()
+	defer c.rateMu.Unlock()
+	if requestsPerSecond <= 0 {
+		c.requestInterval = 0
+		c.nextRequest = time.Time{}
+		return
+	}
+	c.requestInterval = time.Second / time.Duration(requestsPerSecond)
+	if c.requestInterval <= 0 {
+		c.requestInterval = time.Nanosecond
+	}
+	c.nextRequest = time.Time{}
+}
+
+func (c *Client) waitRequestSlot(ctx context.Context) error {
+	c.rateMu.Lock()
+	interval := c.requestInterval
+	if interval <= 0 {
+		c.rateMu.Unlock()
+		return nil
+	}
+	now := time.Now()
+	slot := now
+	if c.nextRequest.After(now) {
+		slot = c.nextRequest
+	}
+	c.nextRequest = slot.Add(interval)
+	c.rateMu.Unlock()
+
+	wait := time.Until(slot)
+	if wait <= 0 {
+		return nil
+	}
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+// SeedConsistencyAnchor restores the last verified checkpoint root from
+// durable monitor state. It is intentionally separate from current so the
+// client cannot serve entries against an unsigned/incomplete synthetic head.
+func (c *Client) SeedConsistencyAnchor(treeSize int64, rootHash []byte) error {
+	if !c.secure {
+		return fmt.Errorf("cannot seed consistency anchor on an unverified Static CT client")
+	}
+	if treeSize < 0 {
+		return fmt.Errorf("negative consistency-anchor tree size %d", treeSize)
+	}
+	if len(rootHash) != sha256.Size {
+		return fmt.Errorf("consistency-anchor root has %d bytes, want %d", len(rootHash), sha256.Size)
+	}
+	c.headMu.Lock()
+	defer c.headMu.Unlock()
+	if c.current != nil {
+		return fmt.Errorf("cannot seed consistency anchor after a current checkpoint was accepted")
+	}
+	c.anchor = &Checkpoint{TreeSize: treeSize, RootHash: append([]byte(nil), rootHash...)}
+	return nil
+}
 
 func (c *Client) GetTreeHead(ctx context.Context) (*ctlog.TreeHead, error) {
 	body, err := c.getWithRetry(ctx, c.monitoringURL+"checkpoint")
@@ -143,6 +229,9 @@ func (c *Client) GetTreeHead(ctx context.Context) (*ctlog.TreeHead, error) {
 
 	c.headMu.Lock()
 	c.current = cp
+	if c.secure {
+		c.anchor = cp
+	}
 	c.headMu.Unlock()
 	return cp.TreeHead(), nil
 }
@@ -150,6 +239,9 @@ func (c *Client) GetTreeHead(ctx context.Context) (*ctlog.TreeHead, error) {
 func (c *Client) verifyConsistency(ctx context.Context, next *Checkpoint) error {
 	c.headMu.RLock()
 	previous := c.current
+	if previous == nil {
+		previous = c.anchor
+	}
 	c.headMu.RUnlock()
 	if previous == nil {
 		return nil
@@ -191,6 +283,43 @@ func (c *Client) currentCheckpoint(ctx context.Context) (*Checkpoint, error) {
 	return c.current, nil
 }
 
+func (c *Client) getDataTile(ctx context.Context, tileIndex uint64, width int) ([]ctlog.RawEntry, error) {
+	path, err := dataTilePath(tileIndex, width)
+	if err != nil {
+		return nil, err
+	}
+	body, fetchErr := c.getWithRetry(ctx, c.monitoringURL+path)
+	usedFullFallback := false
+	if fetchErr != nil && width < tileWidth {
+		fullPath, pathErr := dataTilePath(tileIndex, tileWidth)
+		if pathErr != nil {
+			return nil, pathErr
+		}
+		body, err = c.getWithRetry(ctx, c.monitoringURL+fullPath)
+		if err != nil {
+			return nil, fmt.Errorf("partial data tile %s unavailable (%v); full fallback failed: %w", path, fetchErr, err)
+		}
+		usedFullFallback = true
+	} else if fetchErr != nil {
+		return nil, fetchErr
+	}
+
+	entries, err := parseDataTile(body)
+	if err != nil {
+		return nil, err
+	}
+	if usedFullFallback {
+		if len(entries) < width {
+			return nil, fmt.Errorf("full fallback data tile contains %d entries, need %d", len(entries), width)
+		}
+		return append([]ctlog.RawEntry(nil), entries[:width]...), nil
+	}
+	if len(entries) != width {
+		return nil, fmt.Errorf("data tile decoded %d entries, checkpoint requires %d", len(entries), width)
+	}
+	return entries, nil
+}
+
 func (c *Client) GetRawEntries(ctx context.Context, start, end int64) (*ctlog.GetEntriesResponse, error) {
 	if start < 0 || end < start {
 		return nil, fmt.Errorf("invalid entry range [%d-%d]", start, end)
@@ -215,20 +344,10 @@ func (c *Client) GetRawEntries(ctx context.Context, start, end int64) (*ctlog.Ge
 		if int64(tileIndex) == fullTiles && remainder > 0 {
 			width = remainder
 		}
-		path, err := dataTilePath(tileIndex, width)
-		if err != nil {
-			return nil, err
-		}
-		body, err := c.getWithRetry(ctx, c.monitoringURL+path)
+
+		tileEntries, err := c.getDataTile(ctx, tileIndex, width)
 		if err != nil {
 			return nil, fmt.Errorf("data tile %d: %w", tileIndex, err)
-		}
-		tileEntries, err := parseDataTile(body)
-		if err != nil {
-			return nil, fmt.Errorf("data tile %d: %w", tileIndex, err)
-		}
-		if len(tileEntries) != width {
-			return nil, fmt.Errorf("data tile %d decoded %d entries, checkpoint requires %d", tileIndex, len(tileEntries), width)
 		}
 		remaining := int(end - current + 1)
 		available := width - offset
@@ -269,11 +388,18 @@ func (c *Client) getCached(ctx context.Context, relativePath string) ([]byte, er
 	if err != nil {
 		return nil, err
 	}
+
 	c.cacheMu.Lock()
 	if existing, exists := c.cache[relativePath]; exists {
 		body = existing
 	} else {
+		if len(c.cacheOrder) >= maxStaticCacheEntries {
+			oldest := c.cacheOrder[0]
+			c.cacheOrder = c.cacheOrder[1:]
+			delete(c.cache, oldest)
+		}
 		c.cache[relativePath] = append([]byte(nil), body...)
+		c.cacheOrder = append(c.cacheOrder, relativePath)
 	}
 	c.cacheMu.Unlock()
 	return append([]byte(nil), body...), nil
@@ -303,6 +429,9 @@ func (c *Client) getWithRetry(ctx context.Context, target string) ([]byte, error
 }
 
 func (c *Client) get(ctx context.Context, target string) ([]byte, error) {
+	if err := c.waitRequestSlot(ctx); err != nil {
+		return nil, err
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
 	if err != nil {
 		return nil, err
