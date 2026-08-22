@@ -1,213 +1,269 @@
-
 <div align="center">
 <img src="assets/ct-hulhu.png" alt="ct-hulhu logo" width="20%"/>
 <h1>ct-hulhu</h1>
 
-<p>Simple Certificate Transparency log parser built for recon.</p>
+<p>Direct Certificate Transparency reconnaissance with RFC6962 and cryptographically verified Static CT API support.</p>
 </div>
 
-## Why?
+> This repository is the `da-beda/ct-hulhu` fork. It extends the original ct-hulhu with loss-aware collection, modern Chrome `tiled_logs`, Static CT API v1.1, Merkle/checkpoint verification, durable monitoring state, and evidence-preserving malformed-entry handling.
 
-Most subdomain enumeration tools query third-party services (crt.sh, certspotter API, etc.) for CT data. This works until:
+## Why this fork exists
 
-- The service is down or rate-limited
-- You don't want to reveal your target to third parties
-- The service doesn't index the log you need
-- You need real-time monitoring, not cached results
+Traditional direct CT clients read RFC6962 `get-sth` / `get-entries` endpoints. The public CT ecosystem now also contains Static CT API logs, whose monitoring interface is checkpoint + immutable hash/data tiles rather than RFC6962 read endpoints.
 
-`ct-hulhu` talks directly to CT logs. You get raw, unfiltered access to certificate data the moment it's logged.
+This fork supports both generations through one reader model while making an important distinction explicit:
+
+| Path | Discovery / reading | Cryptographic verification in this fork |
+| --- | --- | --- |
+| Static CT API | Chrome `operators[].tiled_logs`, checkpoint, data/hash tiles | **Yes** — log key/LogID, checkpoint signature, Merkle root, per-entry inclusion, append-only consistency |
+| RFC6962 | Chrome `operators[].logs`, `get-sth`, `get-entries` | **Not yet** — transport/parser checked and emitted as `verified: false` |
+
+A JSON result therefore carries an explicit `verified` field. Do not erase that distinction downstream.
 
 ## Install
 
-```bash
-go install -v github.com/TheArqsz/ct-hulhu/cmd/ct-hulhu@latest
-```
-
-Or build from source:
+The fork deliberately retains the original Go module path while the implementation is being stabilized, so build it from a clone rather than using `go install github.com/da-beda/...@latest`:
 
 ```bash
-git clone https://github.com/TheArqsz/ct-hulhu.git
+git clone https://github.com/da-beda/ct-hulhu.git
 cd ct-hulhu
 make build
 ```
 
-Zero external dependencies. The binary is a single static file.
+or:
 
-## Usage
+```bash
+go install ./cmd/ct-hulhu
+```
 
-### List available CT logs
+The project uses only the Go standard library. The current `go.mod` declares Go 1.24.7.
+
+## Quick start
+
+### Inspect the current trusted log set
 
 ```bash
 ct-hulhu -ls
-ct-hulhu -ls -log-state all    # include retired/readonly logs
-ct-hulhu -ls -json              # JSON output for scripting
+ct-hulhu -ls -json
 ```
 
-### Scrape a specific log
+Auto-discovery understands both traditional and tiled logs. The fork default is:
+
+```text
+-log-state trusted
+```
+
+where `trusted` means:
+
+```text
+usable + qualified + readonly
+```
+
+Individual `usable`, `qualified`, `readonly`, `retired`, and `all` selectors remain available.
+
+### Bounded recent discovery
 
 ```bash
-# Last 10k entries from a log, filter for your target
-ct-hulhu -lu https://ct.googleapis.com/logs/us1/argon2025h1/ -d example.com -from-end -n 10000
-
-# First 50k entries, all domains, JSON output
-ct-hulhu -lu https://ct.googleapis.com/logs/us1/argon2025h1/ -n 50000 -json
+ct-hulhu \
+  -d example.com \
+  -from-end \
+  -n 10000 \
+  -json \
+  -o ct-example.jsonl
 ```
 
-### Auto-discover logs
+`-n` is applied per selected log. Without `-from-end`, `-n 10000` begins at entry zero; it does **not** mean the newest 10,000 entries.
 
-When you don't specify `-lu`, `ct-hulhu` fetches [Google's CT log list](https://www.gstatic.com/ct/log_list/v3/log_list.json) and scrapes all usable logs:
+### Explicit RFC6962 log
+
+`-lu` intentionally remains RFC6962-only because a Static log needs a coherent submission URL, monitoring URL, LogID, and public key. Auto-discovery supplies those values from Chrome's log list instead of guessing them from one URL.
 
 ```bash
-ct-hulhu -d example.com -n 1000
+ct-hulhu \
+  -lu https://ct.googleapis.com/logs/us1/argon2025h1/ \
+  -d example.com \
+  -from-end \
+  -n 5000 \
+  -json
 ```
 
-### Monitor mode
+Results from this path currently carry `"verified": false`.
 
-Watch CT logs for new certificates in real-time:
+## Static CT verification model
+
+For an auto-discovered Static CT log, an entry is accepted through this chain:
+
+```text
+Chrome tiled_logs descriptor
+        |
+        +--> parse SubjectPublicKeyInfo
+        +--> SHA256(SPKI DER) == advertised LogID
+        |
+        v
+signed Static checkpoint
+        |
+        +--> C2SP note key ID matches LogID/origin
+        +--> RFC6962 TreeHeadSignature verifies
+        |
+        v
+Static hash tiles
+        |
+        +--> reconstruct signed checkpoint Merkle root
+        |
+        v
+Static data TileLeaf
+        |
+        +--> RFC6962 leaf hash
+        +--> inclusion path reconstructs checkpoint root
+        |
+        v
+verified CT observation
+```
+
+When a newer checkpoint is observed, the reader also reconstructs the previous tree-size prefix from the newer tree and requires it to equal the previously verified root. Persistent monitor state can seed that previous `(tree_size, root)` after a process restart, so append-only checking does not reset merely because ct-hulhu restarted.
+
+The unauthenticated Static CT compact-name extension is deliberately not used.
+
+## Monitoring and restart safety
+
+Start future-only monitoring:
 
 ```bash
-# Monitor a log, output new domains matching example.com
-ct-hulhu -m -d example.com -lu https://ct.googleapis.com/logs/us1/argon2025h1/
-
-# Poll every 5 seconds, silent mode for piping
-ct-hulhu -m -d example.com -pi 5 -silent
-
-# Feed new domains directly into your pipeline
-ct-hulhu -m -d example.com -silent | httpx -silent | nuclei -t cves/
+ct-hulhu \
+  -m \
+  -d example.com \
+  -json \
+  -o example-monitor.jsonl
 ```
 
-Monitor starts at the current tree position (no history replay) and polls `get-sth` for tree size changes. When new entries appear, only the delta is fetched and processed.
-
-### Pipeline integration
-
-ct-hulhu follows simple rule: data goes to stdout, everything else goes to stderr. Use `-silent` for clean piping.
+The initial current tree position for every selected log is persisted privately. To replay anything added while the process was down and continue from the saved position:
 
 ```bash
-# Subdomain enum -> HTTP probe -> vuln scan
-ct-hulhu -d example.com -n 100000 -silent | sort -u | httpx -silent | nuclei -t cves/
-
-# Domains from stdin
-echo "example.com" | ct-hulhu -silent
-
-# Domain list from file
-ct-hulhu -df targets.txt -n 50000 -silent -o domains.txt
-
-# JSON output with full cert metadata
-ct-hulhu -lu <log-url> -d example.com -json -n 10000
+ct-hulhu \
+  -m \
+  -resume \
+  -d example.com \
+  -json \
+  -o example-monitor.jsonl
 ```
 
-### Resume interrupted scrapes
+Runtime state is versioned and bound to:
+
+- protocol, LogID, and read URL;
+- `verified` trust level;
+- normalized target-domain selection;
+- JSON / field-output semantics;
+- output and malformed-evidence destinations;
+- scrape range semantics where applicable.
+
+Changing those semantics causes state reuse to fail closed rather than silently skipping entries that were never evaluated under the new configuration.
+
+Scrape and monitor state use separate SHA-256-derived filenames under `-state-dir` (default `~/.ct-hulhu`). State files are `0600`; the state directory is restricted to `0700`.
+
+## Malformed certificate evidence
+
+A CT leaf can be cryptographically included while containing certificate material that Go's normal X.509 parser rejects. Such a leaf must not disappear, but it must not permanently wedge monitoring either.
+
+This fork preserves parser failures to append-only JSONL evidence before checkpoint progress is allowed to advance. The default path is:
+
+```text
+<output>.malformed.jsonl
+```
+
+or, when stdout is used:
+
+```text
+<state-dir>/malformed.jsonl
+```
+
+Override it with:
 
 ```bash
-ct-hulhu -lu <log-url> -d example.com -resume
-# Ctrl+C anytime, run the same command again to continue
+-malformed-output path/to/malformed.jsonl
 ```
 
-State is saved to `~/.ct-hulhu/` per log URL.
+Each event records source protocol, LogID/URL, verification status, entry index, parse error, normalized raw `leaf_input` / `extra_data`, and Static issuer fingerprints when available. The file is `0600` and is flushed + `fsync`'d before a batch containing malformed observations can advance its persistent checkpoint.
 
-## Flags
+## Output durability and provenance
 
-```
-TARGET:
-  -d,  -domain string[]        target domain(s) to filter (comma-separated)
-  -df                          file containing target domains (one per line)
+When `-o` is used, output files are restricted to `0600`, including pre-existing files. `Flush()` is a durability boundary: it flushes the Go buffer and `fsync`s the output before persistent progress may advance.
 
-LOG SELECTION:
-  -lu, -log-url string[]      CT log URL(s) to scrape
-  -ls, -list-logs             list available CT logs and exit
-       -log-state string      filter logs by state: usable/readonly/retired/qualified/all (default: usable)
+JSON output includes fields such as:
 
-SCRAPING:
-  -w,  -workers int           concurrent fetch workers (default: 4)
-  -pw, -parse-workers int     concurrent parse workers, 0 = auto (default: 0)
-  -bs, -batch-size int        entries per request (default: 256)
-  -rl, -rate-limit int        max requests/sec, 0 = unlimited (default: 0)
-  -to, -timeout int           HTTP timeout in seconds (default: 30)
-       -retries int           retries per failed request (default: 3)
-       -start int             start entry index (default: auto)
-  -n,  -count int             entries to fetch, 0 = all (default: 0)
-       -from-end              start from newest entries
-
-MONITOR:
-  -m,  -monitor               continuous monitoring mode
-  -pi, -poll-interval int     seconds between polls (default: 10)
-
-OUTPUT:
-  -o,  -output string         output file path
-  -j,  -json                  JSON line output
-  -f,  -fields string         output fields: domains/ips/emails/certs/all (default: domains)
-  -s,  -silent                only output results (no banner, no progress)
-  -v,  -verbose               verbose/debug output
-  -nc, -no-color              disable color output
-
-UPDATE:
-  -up, -update                update ct-hulhu to latest version
-  -duc, -disable-update-check disable automatic update check
-
-STATE:
-       -resume                resume from last saved position
-       -state-dir string      state file directory (default: ~/.ct-hulhu)
-```
-
-## How it works
-
-### CT log protocol ([RFC 6962](https://datatracker.ietf.org/doc/html/rfc6962))
-
-CT logs are append-only Merkle trees of TLS certificates. Every publicly trusted CA must submit certificates before issuance ([Chrome CT policy](https://googlechrome.github.io/CertificateTransparency/ct_policy.html)). The protocol exposes two endpoints we care about:
-
-- **`get-sth`** - Returns the [Signed Tree Head](https://datatracker.ietf.org/doc/html/rfc6962#section-4.3) (current tree size + root hash). This is how we know how many entries exist and detect new ones.
-- **`get-entries?start=N&end=M`** - Returns raw log entries ([MerkleTreeLeaf](https://datatracker.ietf.org/doc/html/rfc6962#section-3.4) structures containing DER-encoded certificates).
-
-### Scraping pipeline
-
-1. Query `get-sth` to get the tree size
-2. Generate batch ranges based on `-start`, `-n`, `-from-end`
-3. Adaptive worker pool fetches batches concurrently (starts with 1 worker, ramps up based on error rate)
-4. Each entry's `leaf_input` is decoded from base64, then the structure is parsed to extract the DER certificate
-5. **Fast-path filtering**: if `-d` is set, raw DER bytes are scanned for the target domain string *before* full X.509 parsing. Domain names appear as ASCII in DER-encoded certs (per [RFC 5280 encoding rules](https://datatracker.ietf.org/doc/html/rfc5280#section-4.2.1.6)), so this is a cheap pre-filter that avoids expensive ASN.1 parsing on non-matching entries.
-6. Full [X.509](https://datatracker.ietf.org/doc/html/rfc5280) parse extracts Subject CN, DNS SANs, IP SANs, email SANs, issuer, serial, validity
-7. Domain matching supports exact, subdomain (`.example.com` matches `sub.example.com`) and wildcard certs (`*.example.com`)
-8. Output writer deduplicates results and streams to stdout/file
-
-### Adaptive concurrency
-
-The worker pool starts with 1 goroutine and ramps up every `500ms` if the error rate stays below `10%`. This avoids hammering logs that are slow to respond while maximizing throughput on fast ones. On errors, workers back off exponentially.
-
-### Monitor mode
-
-Polls `get-sth` at a configurable interval. When the tree size grows, fetches only the new entries (the delta between old and new tree size). Deduplication persists across the entire monitoring session.
-
-## Output formats
-
-**Plain text** (default) - one domain per line, deduplicated:
-```
-sub.example.com
-api.example.com
-staging.example.com
-```
-
-**JSON lines** (`-json`) - full certificate metadata per line:
 ```json
-{"domains":["sub.example.com","*.example.com"],"cn":"sub.example.com","issuer":"Let's Encrypt","not_before":"2025-01-01T00:00:00Z","not_after":"2025-04-01T00:00:00Z","serial":"abc123","is_precert":true,"log_url":"https://ct.googleapis.com/logs/us1/argon2025h1/","index":12345}
+{
+  "domains": ["api.example.com"],
+  "protocol": "static-ct-api",
+  "log_id": "...",
+  "log_url": "https://.../monitoring/",
+  "index": 12345,
+  "timestamp": "2026-08-22T12:34:56.789Z",
+  "leaf_hash": "...",
+  "cert_sha256": "...",
+  "issuer_fingerprints": ["..."],
+  "verified": true
+}
 ```
 
-**Other field modes** (`-f`):
-- `domains` - DNS names from CN + SANs (default)
-- `ips` - IP addresses from SANs
-- `emails` - email addresses from SANs
-- `certs` - one-line cert summaries
-- `all` - domains + IPs + emails combined
+Certificate serial numbers are metadata only. Dedup identity uses protocol + log identity + entry index rather than `serial + log_url`, because certificate serials are issuer-scoped and are not globally unique.
 
-## Contributing
+## Failure semantics
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for build instructions, project structure, conventions and development workflow.
+The collector is intentionally loss-aware:
+
+- failed/non-empty ranges are errors, not warning-only success;
+- zero-entry, nil, or oversized logical responses fail closed;
+- out-of-order worker completion cannot advance resume state across a gap;
+- monitor positions move only after the corresponding output/evidence is durable and the new monitor state is persisted;
+- a failed monitor delta retains the previous position and is retried on a later poll;
+- monitor startup fails if any selected log cannot initialize, rather than quietly claiming partial coverage as complete.
+
+Retries and HTTP responses are bounded. `-rl` caps underlying CT HTTP requests. Static CT applies the cap inside the reader because one logical range can require checkpoint, data-tile, and hash-tile traffic.
+
+## Scope and downstream use
+
+Certificate Transparency is an observation source, not proof of present ownership, live DNS, bounty scope, or authorization to probe a hostname.
+
+A safe workflow is:
+
+```text
+CT evidence
+    -> identifier normalization
+    -> program scope / ownership decision
+    -> inventory + change classification
+    -> explicitly authorized active probing
+```
+
+Do not pipe newly observed CT names directly into broad active scanners unless an external authorization/scope layer has already made that decision.
+
+## Important remaining limitation
+
+The Static CT path is cryptographically verified. The traditional RFC6962 path currently is not: it retrieves STHs and entries but does not yet verify the log public key, STH signature, consistency proof, and per-entry audit proof. Those JSON observations are explicitly marked:
+
+```json
+"verified": false
+```
+
+Implementing RFC6962 proof parity is a worthwhile follow-up, but the fork does not hide the current difference.
+
+## Development validation
+
+The repository CI workflow runs:
+
+```bash
+go vet ./...
+go build ./cmd/ct-hulhu/
+go test -race ./...
+```
+
+On a newly created GitHub fork, Actions may require a one-time manual enable before PR workflows execute.
 
 ## References
 
-- [RFC 6962](https://datatracker.ietf.org/doc/html/rfc6962) - Certificate Transparency v1 (protocol implemented by ct-hulhu)
-- [RFC 5280](https://datatracker.ietf.org/doc/html/rfc5280) - X.509 PKI certificate format
-- [Chrome CT Policy](https://googlechrome.github.io/CertificateTransparency/ct_policy.html) - Browser-enforced logging requirements
-- [Google CT Log List](https://www.gstatic.com/ct/log_list/v3/log_list.json) - Public log discovery endpoint (v3 schema)
+- RFC 6962 — Certificate Transparency v1
+- C2SP Static CT API v1.1
+- Chrome Certificate Transparency Log Policy
+- Chrome CT log list v3
 
 ## License
 
