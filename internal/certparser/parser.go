@@ -47,9 +47,12 @@ func (p *Parser) ParseEntryFromSource(entry ctlog.RawEntry, index int64, source 
 	if err != nil {
 		return nil, fmt.Errorf("decoding leaf_input: %w", err)
 	}
-	if len(p.domainFilter) > 0 && !p.rawBytesMatchDomain(leafBytes) {
-		return nil, nil
-	}
+
+	// Do not use the raw-DER substring matcher as an authoritative negative
+	// filter. It is useful as a benchmark/heuristic, but certificate names can
+	// be represented in ways that do not safely preserve the user's literal
+	// filter bytes (for example internationalized names). Parse first and make
+	// the actual X.509 identifiers authoritative.
 	certInfo, err := p.parseMerkleTreeLeaf(leafBytes, entry.ExtraData)
 	if err != nil {
 		return nil, err
@@ -67,6 +70,9 @@ func (p *Parser) ParseEntryFromSource(entry ctlog.RawEntry, index int64, source 
 	return result, nil
 }
 
+// rawBytesMatchDomain remains available for benchmarks and non-authoritative
+// hints. Callers must never treat a false result as proof that an X.509 entry
+// does not contain a matching identifier.
 func (p *Parser) rawBytesMatchDomain(data []byte) bool {
 	for _, domainBytes := range p.domainFilterBytes {
 		if containsFoldASCII(data, domainBytes) {
@@ -245,6 +251,7 @@ func (p *Parser) buildResult(info *ctlog.CertInfo, source ctlog.EntrySource) *ct
 		Protocol:          source.Protocol,
 		LogID:             source.LogID,
 		LogURL:            source.LogURL,
+		Verified:          source.Verified,
 		Serial:            serial,
 		LeafHash:          info.LeafHash,
 		CertificateSHA256: hex.EncodeToString(certHash[:]),
