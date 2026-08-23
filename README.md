@@ -61,6 +61,23 @@ usable + qualified + readonly
 
 Individual `usable`, `qualified`, `readonly`, `retired`, and `all` selectors remain available.
 
+### Preserve the exact Chrome log-list configuration
+
+For evidence-producing automation, preserve the exact auto-discovery document used by the collector:
+
+```bash
+ct-hulhu \
+  -d example.com \
+  -from-end \
+  -n 10000 \
+  -json \
+  -log-list-output evidence/chrome-log-list.json
+```
+
+`-log-list-output` writes the **same response bytes that are parsed** by the auto-discovery path; it does not perform a second fetch. The artifact is written atomically as `0600`, and symlinked parent/destination paths are rejected. This preserves the Chrome log-list version, log state, monitoring/submission URLs, LogIDs and public-key material used for that collection generation.
+
+The option is intentionally incompatible with explicit `-lu`, because explicit RFC6962 URLs bypass auto-discovery and therefore do not consume the Chrome log list. It must also be distinct from ordinary and malformed output paths.
+
 ### Bounded recent discovery
 
 ```bash
