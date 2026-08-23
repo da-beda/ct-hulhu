@@ -6,6 +6,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/TheArqsz/ct-hulhu/internal/loglist"
 )
 
 type stringSlice []string
@@ -25,9 +27,10 @@ type Options struct {
 	Domain     stringSlice
 	DomainFile string
 
-	LogURL   stringSlice
-	ListLogs bool
-	LogState string
+	LogURL        stringSlice
+	ListLogs      bool
+	LogState      string
+	LogListOutput string
 
 	Workers      int
 	ParseWorkers int
@@ -68,6 +71,7 @@ func ParseOptions() *Options {
 	flag.BoolVar(&o.ListLogs, "ls", false, "list available CT logs and exit")
 	flag.BoolVar(&o.ListLogs, "list-logs", false, "list available CT logs and exit")
 	flag.StringVar(&o.LogState, "log-state", "trusted", "filter logs by state (trusted/usable/readonly/retired/qualified/all)")
+	flag.StringVar(&o.LogListOutput, "log-list-output", "", "write the exact auto-discovery log-list response bytes to this file")
 
 	flag.IntVar(&o.Workers, "w", 4, "number of concurrent fetch workers")
 	flag.IntVar(&o.Workers, "workers", 4, "number of concurrent fetch workers")
@@ -124,7 +128,19 @@ func ParseOptions() *Options {
 	}
 	configureLogger(o.Silent, o.Verbose, o.NoColor)
 	o.validate()
+	loglist.SetEvidenceOutput(o.LogListOutput)
 	return o
+}
+
+func canonicalOptionPath(path string) (string, error) {
+	if path == "" {
+		return "", nil
+	}
+	absolute, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Clean(absolute), nil
 }
 
 func (o *Options) validate() {
@@ -158,6 +174,29 @@ func (o *Options) validate() {
 	if !validStates[o.LogState] {
 		problems = append(problems, fmt.Sprintf("--log-state must be one of: trusted, usable, readonly, qualified, retired, all (got %q)", o.LogState))
 	}
+	if o.LogListOutput != "" {
+		if len(o.LogURL) > 0 {
+			problems = append(problems, "-log-list-output requires auto-discovery and cannot be combined with -lu/--log-url")
+		}
+		logListPath, err := canonicalOptionPath(o.LogListOutput)
+		if err != nil {
+			problems = append(problems, fmt.Sprintf("invalid -log-list-output path: %v", err))
+		} else {
+			for label, candidate := range map[string]string{
+				"normal output":    o.Output,
+				"malformed output": o.MalformedOutput,
+			} {
+				other, otherErr := canonicalOptionPath(candidate)
+				if otherErr != nil {
+					problems = append(problems, fmt.Sprintf("invalid %s path: %v", label, otherErr))
+					continue
+				}
+				if other != "" && other == logListPath {
+					problems = append(problems, fmt.Sprintf("-log-list-output must be distinct from %s", label))
+				}
+			}
+		}
+	}
 	if len(problems) > 0 {
 		for _, problem := range problems {
 			fmt.Fprintf(os.Stderr, "error: %s\n", problem)
@@ -177,7 +216,7 @@ func defaultStateDir() string {
 func printFlags() {
 	w := os.Stderr
 	fmt.Fprintln(w, "\nTARGET:\n  -d, -domain string[]        target domain(s)\n  -df string                  file containing target domains")
-	fmt.Fprintln(w, "\nLOG SELECTION:\n  -lu, -log-url string[]      explicit RFC6962 log URL(s)\n  -ls, -list-logs             list RFC6962 + Static CT logs\n  -log-state string           trusted=usable+qualified+readonly (default: trusted)")
+	fmt.Fprintln(w, "\nLOG SELECTION:\n  -lu, -log-url string[]      explicit RFC6962 log URL(s)\n  -ls, -list-logs             list RFC6962 + Static CT logs\n  -log-state string           trusted=usable+qualified+readonly (default: trusted)\n  -log-list-output string     persist exact auto-discovery log-list bytes")
 	fmt.Fprintln(w, "\nSCRAPING:\n  -w, -workers int            concurrent fetch workers (default: 4)\n  -pw, -parse-workers int     concurrent parse workers, 0=auto\n  -bs, -batch-size int        entries per range request (default: 256)\n  -rl, -rate-limit int        max requests/sec, 0=unlimited\n  -to, -timeout int           HTTP timeout seconds (default: 30)\n  -retries int                retries per failed request (default: 3)\n  -start int                  start entry index\n  -n, -count int              entries to fetch, 0=all\n  -from-end                   start from newest entries")
 	fmt.Fprintln(w, "\nMONITOR:\n  -m, -monitor                continuous monitoring\n  -pi, -poll-interval int     seconds between polls")
 	fmt.Fprintln(w, "\nOUTPUT:\n  -o, -output string          output file\n  -malformed-output string    malformed-entry evidence JSONL\n  -j, -json                   JSON lines\n  -f, -fields string          domains/ips/emails/certs/all\n  -s, -silent                 results only\n  -v, -verbose                debug output\n  -nc, -no-color              disable color")

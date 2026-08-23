@@ -2,8 +2,12 @@ package loglist
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -104,26 +108,31 @@ func TestFilterLogs(t *testing.T) {
 	}
 }
 
-func TestFetch(t *testing.T) {
-	const logListJSON = `{
-		"version": "3",
-		"operators": [{
-			"name": "TestOp",
-			"email": ["test@example.com"],
-			"logs": [{
-				"description": "TestLog",
-				"log_id": "abc123",
-				"url": "ct.example.com/log/",
-				"mmd": 86400,
-				"state": {"usable": {"timestamp": "2025-01-01T00:00:00Z"}}
-			}]
+const testLogListJSON = `{
+	"version": "3",
+	"operators": [{
+		"name": "TestOp",
+		"email": ["test@example.com"],
+		"logs": [{
+			"description": "TestLog",
+			"log_id": "abc123",
+			"url": "ct.example.com/log/",
+			"mmd": 86400,
+			"state": {"usable": {"timestamp": "2025-01-01T00:00:00Z"}}
 		}]
-	}`
+	}]
+}`
 
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+func testLogListServer(t *testing.T) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte(logListJSON))
+		_, _ = w.Write([]byte(testLogListJSON))
 	}))
+}
+
+func TestFetch(t *testing.T) {
+	srv := testLogListServer(t)
 	defer srv.Close()
 
 	fetcher := NewFetcher(5 * time.Second)
@@ -148,6 +157,72 @@ func TestFetch(t *testing.T) {
 	}
 }
 
+func TestFetchRawPreservesExactResponseBytes(t *testing.T) {
+	srv := testLogListServer(t)
+	defer srv.Close()
+
+	fetcher := NewFetcher(5 * time.Second)
+	logList, raw, err := fetcher.FetchRaw(context.Background(), srv.URL)
+	if err != nil {
+		t.Fatalf("FetchRaw error: %v", err)
+	}
+	if logList.Version != "3" {
+		t.Fatalf("version = %q", logList.Version)
+	}
+	if string(raw) != testLogListJSON {
+		t.Fatalf("raw response bytes changed before parsing/preservation")
+	}
+}
+
+func TestPersistEvidenceIsExactPrivateAndDigestBound(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "nested", "log-list.json")
+	body := []byte(testLogListJSON)
+	digest, err := persistEvidence(path, body)
+	if err != nil {
+		t.Fatalf("persistEvidence: %v", err)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(body) {
+		t.Fatal("persisted log-list bytes differ from fetched bytes")
+	}
+	sum := sha256.Sum256(body)
+	if digest != hex.EncodeToString(sum[:]) {
+		t.Fatalf("digest = %s, want %x", digest, sum)
+	}
+	if info, err := os.Stat(path); err != nil {
+		t.Fatal(err)
+	} else if info.Mode().Perm() != 0o600 {
+		t.Fatalf("mode = %o, want 600", info.Mode().Perm())
+	}
+}
+
+func TestPersistEvidenceRejectsSymlinkParent(t *testing.T) {
+	root := t.TempDir()
+	external := filepath.Join(root, "external")
+	if err := os.Mkdir(external, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(root, "link")
+	if err := os.Symlink(external, link); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	if _, err := persistEvidence(filepath.Join(link, "log-list.json"), []byte(testLogListJSON)); err == nil {
+		t.Fatal("expected symlink-parent rejection")
+	}
+}
+
+func TestEvidenceOutputSetting(t *testing.T) {
+	SetEvidenceOutput("/tmp/ct-hulhu-log-list-evidence")
+	t.Cleanup(func() { SetEvidenceOutput("") })
+	if got := evidenceOutput(); got != "/tmp/ct-hulhu-log-list-evidence" {
+		t.Fatalf("evidenceOutput = %q", got)
+	}
+}
+
 func TestFetch_ServerError(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
@@ -163,7 +238,7 @@ func TestFetch_ServerError(t *testing.T) {
 
 func TestFetch_InvalidJSON(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte("not json"))
+		_, _ = w.Write([]byte("not json"))
 	}))
 	defer srv.Close()
 
