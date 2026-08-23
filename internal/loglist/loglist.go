@@ -173,6 +173,7 @@ func FilterLogs(logList *LogList, stateFilter string) []LogWithOperator {
 			if logEntry.MatchesState(stateFilter) {
 				result = append(result, LogWithOperator{Log: logEntry, Operator: op.Name})
 			}
+		}
 	}
 	return result
 }
