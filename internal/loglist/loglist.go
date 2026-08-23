@@ -2,10 +2,15 @@ package loglist
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/TheArqsz/ct-hulhu/internal/ctlog"
@@ -13,6 +18,25 @@ import (
 
 const DefaultLogListURL = "https://www.gstatic.com/ct/log_list/v3/log_list.json"
 const maxLogListSize = 4 << 20
+
+var evidenceConfig struct {
+	sync.RWMutex
+	path string
+}
+
+// SetEvidenceOutput configures a process-local path where FetchDefault writes
+// the exact response bytes it parses. An empty path disables persistence.
+func SetEvidenceOutput(path string) {
+	evidenceConfig.Lock()
+	evidenceConfig.path = path
+	evidenceConfig.Unlock()
+}
+
+func evidenceOutput() string {
+	evidenceConfig.RLock()
+	defer evidenceConfig.RUnlock()
+	return evidenceConfig.path
+}
 
 type Fetcher struct {
 	client *http.Client
@@ -63,12 +87,81 @@ func (f *Fetcher) Fetch(ctx context.Context, url string) (*LogList, error) {
 }
 
 func (f *Fetcher) FetchDefaultRaw(ctx context.Context) (*LogList, []byte, error) {
-	return f.FetchRaw(ctx, DefaultLogListURL)
+	ll, body, err := f.FetchRaw(ctx, DefaultLogListURL)
+	if err != nil {
+		return nil, nil, err
+	}
+	if path := evidenceOutput(); path != "" {
+		if _, err := persistEvidence(path, body); err != nil {
+			return nil, nil, fmt.Errorf("persisting log-list evidence: %w", err)
+		}
+	}
+	return ll, body, nil
 }
 
 func (f *Fetcher) FetchDefault(ctx context.Context) (*LogList, error) {
 	ll, _, err := f.FetchDefaultRaw(ctx)
 	return ll, err
+}
+
+func persistEvidence(path string, body []byte) (string, error) {
+	absolute, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	absolute = filepath.Clean(absolute)
+	parent := filepath.Dir(absolute)
+	if err := os.MkdirAll(parent, 0o700); err != nil {
+		return "", err
+	}
+	resolvedParent, err := filepath.EvalSymlinks(parent)
+	if err != nil {
+		return "", err
+	}
+	if resolvedParent != parent {
+		return "", fmt.Errorf("log-list evidence parent contains a symlink: %s", parent)
+	}
+	if info, err := os.Lstat(absolute); err == nil {
+		if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+			return "", fmt.Errorf("log-list evidence destination is not a regular file: %s", absolute)
+		}
+	} else if !os.IsNotExist(err) {
+		return "", err
+	}
+
+	tmp, err := os.CreateTemp(parent, ".log-list-*")
+	if err != nil {
+		return "", err
+	}
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath)
+	if err := tmp.Chmod(0o600); err != nil {
+		tmp.Close()
+		return "", err
+	}
+	if _, err := tmp.Write(body); err != nil {
+		tmp.Close()
+		return "", err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return "", err
+	}
+	if err := tmp.Close(); err != nil {
+		return "", err
+	}
+	if err := os.Rename(tmpPath, absolute); err != nil {
+		return "", err
+	}
+	if err := os.Chmod(absolute, 0o600); err != nil {
+		return "", err
+	}
+	if dir, err := os.Open(parent); err == nil {
+		_ = dir.Sync()
+		_ = dir.Close()
+	}
+	digest := sha256.Sum256(body)
+	return hex.EncodeToString(digest[:]), nil
 }
 
 // FilterLogs preserves the original RFC6962-only API for callers/tests that
@@ -80,7 +173,6 @@ func FilterLogs(logList *LogList, stateFilter string) []LogWithOperator {
 			if logEntry.MatchesState(stateFilter) {
 				result = append(result, LogWithOperator{Log: logEntry, Operator: op.Name})
 			}
-		}
 	}
 	return result
 }
