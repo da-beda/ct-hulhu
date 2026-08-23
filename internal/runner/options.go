@@ -132,6 +132,17 @@ func ParseOptions() *Options {
 	return o
 }
 
+func canonicalOptionPath(path string) (string, error) {
+	if path == "" {
+		return "", nil
+	}
+	absolute, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Clean(absolute), nil
+}
+
 func (o *Options) validate() {
 	var problems []string
 	if o.Workers < 1 || o.Workers > 128 {
@@ -162,6 +173,29 @@ func (o *Options) validate() {
 	validStates := map[string]bool{"trusted": true, "usable": true, "readonly": true, "qualified": true, "retired": true, "all": true}
 	if !validStates[o.LogState] {
 		problems = append(problems, fmt.Sprintf("--log-state must be one of: trusted, usable, readonly, qualified, retired, all (got %q)", o.LogState))
+	}
+	if o.LogListOutput != "" {
+		if len(o.LogURL) > 0 {
+			problems = append(problems, "-log-list-output requires auto-discovery and cannot be combined with -lu/--log-url")
+		}
+		logListPath, err := canonicalOptionPath(o.LogListOutput)
+		if err != nil {
+			problems = append(problems, fmt.Sprintf("invalid -log-list-output path: %v", err))
+		} else {
+			for label, candidate := range map[string]string{
+				"normal output":    o.Output,
+				"malformed output": o.MalformedOutput,
+			} {
+				other, otherErr := canonicalOptionPath(candidate)
+				if otherErr != nil {
+					problems = append(problems, fmt.Sprintf("invalid %s path: %v", label, otherErr))
+					continue
+				}
+				if other != "" && other == logListPath {
+					problems = append(problems, fmt.Sprintf("-log-list-output must be distinct from %s", label))
+				}
+			}
+		}
 	}
 	if len(problems) > 0 {
 		for _, problem := range problems {
