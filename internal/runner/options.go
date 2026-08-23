@@ -6,6 +6,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/TheArqsz/ct-hulhu/internal/loglist"
 )
 
 type stringSlice []string
@@ -126,6 +128,7 @@ func ParseOptions() *Options {
 	}
 	configureLogger(o.Silent, o.Verbose, o.NoColor)
 	o.validate()
+	loglist.SetEvidenceOutput(o.LogListOutput)
 	return o
 }
 
