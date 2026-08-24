@@ -11,7 +11,7 @@ func main() {
 	opts := runner.ParseOptions()
 
 	r := runner.New(opts)
-	if err := r.Run(); err != nil {
+	if err := r.RunWithBaseline(); err != nil {
 		fmt.Fprintf(os.Stderr, "[ERR] ct-hulhu: %v\n", err)
 		os.Exit(1)
 	}
