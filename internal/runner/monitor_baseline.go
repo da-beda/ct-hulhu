@@ -52,6 +52,9 @@ func privateFreshJSON(path string, value any) error {
 	if filepath.Clean(resolvedParent) != parent {
 		return fmt.Errorf("monitor-baseline parent contains a symlink: %s", parent)
 	}
+	if err := os.Chmod(parent, 0o700); err != nil {
+		return err
+	}
 	if _, err := os.Lstat(absolute); err == nil {
 		return fmt.Errorf("monitor-baseline destination already exists: %s", absolute)
 	} else if !os.IsNotExist(err) {
@@ -143,6 +146,9 @@ func writeMonitorBaseline(path, stateDir, selectionHash string, initializedPaths
 		}
 		if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
 			return fmt.Errorf("monitor-baseline state path is not a regular file: %s", absolute)
+		}
+		if info.Mode().Perm()&0o077 != 0 {
+			return fmt.Errorf("monitor-baseline state file is not private: %s", absolute)
 		}
 		if info.Size() < 0 || total+info.Size() > maxMonitorBaselineBytes {
 			return fmt.Errorf("monitor-baseline state exceeds %d bytes", maxMonitorBaselineBytes)
