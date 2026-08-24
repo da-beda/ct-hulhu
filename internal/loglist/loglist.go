@@ -25,7 +25,9 @@ var evidenceConfig struct {
 }
 
 // SetEvidenceOutput configures a process-local path where FetchDefault writes
-// the exact response bytes it parses. An empty path disables persistence.
+// the exact signed response bytes it parses. An empty path disables
+// persistence. Signature, reviewed public-key and verification-manifest
+// sidecars use deterministic suffixes on the configured path.
 func SetEvidenceOutput(path string) {
 	evidenceConfig.Lock()
 	evidenceConfig.path = path
@@ -39,46 +41,69 @@ func evidenceOutput() string {
 }
 
 type Fetcher struct {
-	client *http.Client
+	client                 *http.Client
+	defaultLogListURL      string
+	defaultSignatureURL    string
+	verifyDefaultSignature func([]byte, []byte) (*SignatureVerificationEvidence, error)
 }
 
 func NewFetcher(timeout time.Duration) *Fetcher {
-	return &Fetcher{client: &http.Client{Timeout: timeout}}
+	return &Fetcher{
+		client:                 &http.Client{Timeout: timeout},
+		defaultLogListURL:      DefaultLogListURL,
+		defaultSignatureURL:    DefaultLogListSignatureURL,
+		verifyDefaultSignature: verifyChromeLogListSignature,
+	}
 }
 
-// FetchRaw returns both the parsed log list and the exact response body bytes
-// that were parsed. Keeping the raw bytes available lets callers persist the
-// trust/configuration document used for a collection generation without issuing
-// a second, potentially different network fetch.
-func (f *Fetcher) FetchRaw(ctx context.Context, url string) (*LogList, []byte, error) {
+func (f *Fetcher) fetchRawBytes(ctx context.Context, url string, limit int64) ([]byte, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		return nil, nil, fmt.Errorf("creating request: %w", err)
+		return nil, fmt.Errorf("creating request: %w", err)
 	}
 	req.Header.Set("User-Agent", "ct-hulhu")
 
 	resp, err := f.client.Do(req)
 	if err != nil {
-		return nil, nil, fmt.Errorf("fetching log list: %w", err)
+		return nil, fmt.Errorf("fetching %s: %w", url, err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return nil, nil, fmt.Errorf("unexpected status %d from %s", resp.StatusCode, url)
+		return nil, fmt.Errorf("unexpected status %d from %s", resp.StatusCode, url)
 	}
 
-	body, err := io.ReadAll(io.LimitReader(resp.Body, maxLogListSize+1))
+	body, err := io.ReadAll(io.LimitReader(resp.Body, limit+1))
 	if err != nil {
-		return nil, nil, fmt.Errorf("reading response body: %w", err)
+		return nil, fmt.Errorf("reading response body from %s: %w", url, err)
 	}
-	if len(body) > maxLogListSize {
-		return nil, nil, fmt.Errorf("log list exceeds %d bytes", maxLogListSize)
+	if int64(len(body)) > limit {
+		return nil, fmt.Errorf("response from %s exceeds %d bytes", url, limit)
 	}
+	return body, nil
+}
 
+func parseLogList(body []byte) (*LogList, error) {
 	var ll LogList
 	if err := json.Unmarshal(body, &ll); err != nil {
-		return nil, nil, fmt.Errorf("parsing log list JSON: %w", err)
+		return nil, fmt.Errorf("parsing log list JSON: %w", err)
 	}
-	return &ll, body, nil
+	return &ll, nil
+}
+
+// FetchRaw returns both the parsed log list and the exact response body bytes
+// for an explicitly supplied URL. This generic API does not infer a detached
+// signature URL; callers that need Chrome's signed default list should use
+// FetchDefaultRaw.
+func (f *Fetcher) FetchRaw(ctx context.Context, url string) (*LogList, []byte, error) {
+	body, err := f.fetchRawBytes(ctx, url, maxLogListSize)
+	if err != nil {
+		return nil, nil, err
+	}
+	ll, err := parseLogList(body)
+	if err != nil {
+		return nil, nil, err
+	}
+	return ll, body, nil
 }
 
 func (f *Fetcher) Fetch(ctx context.Context, url string) (*LogList, error) {
@@ -86,14 +111,32 @@ func (f *Fetcher) Fetch(ctx context.Context, url string) (*LogList, error) {
 	return ll, err
 }
 
+// FetchDefaultRaw fetches Chrome's default list and detached signature,
+// verifies the exact JSON bytes against the reviewed embedded Chrome key, then
+// parses and optionally persists the verified evidence set.
 func (f *Fetcher) FetchDefaultRaw(ctx context.Context) (*LogList, []byte, error) {
-	ll, body, err := f.FetchRaw(ctx, DefaultLogListURL)
+	body, err := f.fetchRawBytes(ctx, f.defaultLogListURL, maxLogListSize)
+	if err != nil {
+		return nil, nil, err
+	}
+	signature, err := f.fetchRawBytes(ctx, f.defaultSignatureURL, maxLogListSignatureSize)
+	if err != nil {
+		return nil, nil, fmt.Errorf("fetching Chrome log-list signature: %w", err)
+	}
+	if f.verifyDefaultSignature == nil {
+		return nil, nil, fmt.Errorf("default log-list signature verifier is not configured")
+	}
+	verification, err := f.verifyDefaultSignature(body, signature)
+	if err != nil {
+		return nil, nil, err
+	}
+	ll, err := parseLogList(body)
 	if err != nil {
 		return nil, nil, err
 	}
 	if path := evidenceOutput(); path != "" {
-		if _, err := persistEvidence(path, body); err != nil {
-			return nil, nil, fmt.Errorf("persisting log-list evidence: %w", err)
+		if err := persistSignedLogListEvidence(path, body, signature, verification); err != nil {
+			return nil, nil, fmt.Errorf("persisting signed log-list evidence: %w", err)
 		}
 	}
 	return ll, body, nil
