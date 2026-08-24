@@ -50,8 +50,9 @@ type Options struct {
 	Verbose         bool
 	NoColor         bool
 
-	Monitor      bool
-	PollInterval int
+	Monitor               bool
+	PollInterval          int
+	MonitorBaselineOutput string
 
 	Update             bool
 	DisableUpdateCheck bool
@@ -107,6 +108,7 @@ func ParseOptions() *Options {
 	flag.BoolVar(&o.Monitor, "m", false, "continuous monitoring mode - watch for new entries")
 	flag.IntVar(&o.PollInterval, "poll-interval", 10, "seconds between tree-head polls in monitor mode")
 	flag.IntVar(&o.PollInterval, "pi", 10, "seconds between tree-head polls in monitor mode")
+	flag.StringVar(&o.MonitorBaselineOutput, "monitor-baseline-output", "", "write newly initialized monitor-state files before the first delta poll")
 
 	flag.BoolVar(&o.Update, "up", false, "update ct-hulhu (disabled in this fork build)")
 	flag.BoolVar(&o.Update, "update", false, "update ct-hulhu (disabled in this fork build)")
@@ -141,6 +143,17 @@ func canonicalOptionPath(path string) (string, error) {
 		return "", err
 	}
 	return filepath.Clean(absolute), nil
+}
+
+func optionPathWithin(root, candidate string) bool {
+	if root == "" || candidate == "" {
+		return false
+	}
+	relative, err := filepath.Rel(root, candidate)
+	if err != nil {
+		return false
+	}
+	return relative == "." || (relative != ".." && !strings.HasPrefix(relative, ".."+string(os.PathSeparator)))
 }
 
 func (o *Options) validate() {
@@ -183,8 +196,9 @@ func (o *Options) validate() {
 			problems = append(problems, fmt.Sprintf("invalid -log-list-output path: %v", err))
 		} else {
 			for label, candidate := range map[string]string{
-				"normal output":    o.Output,
-				"malformed output": o.MalformedOutput,
+				"normal output":           o.Output,
+				"malformed output":        o.MalformedOutput,
+				"monitor baseline output": o.MonitorBaselineOutput,
 			} {
 				other, otherErr := canonicalOptionPath(candidate)
 				if otherErr != nil {
@@ -194,6 +208,39 @@ func (o *Options) validate() {
 				if other != "" && other == logListPath {
 					problems = append(problems, fmt.Sprintf("-log-list-output must be distinct from %s", label))
 				}
+			}
+		}
+	}
+	if o.MonitorBaselineOutput != "" {
+		if !o.Monitor {
+			problems = append(problems, "-monitor-baseline-output is valid only with -m/--monitor")
+		}
+		if !o.Resume {
+			problems = append(problems, "-monitor-baseline-output requires -resume")
+		}
+		baselinePath, err := canonicalOptionPath(o.MonitorBaselineOutput)
+		if err != nil {
+			problems = append(problems, fmt.Sprintf("invalid -monitor-baseline-output path: %v", err))
+		} else {
+			for label, candidate := range map[string]string{
+				"normal output":    o.Output,
+				"malformed output": o.MalformedOutput,
+				"log-list output":  o.LogListOutput,
+			} {
+				other, otherErr := canonicalOptionPath(candidate)
+				if otherErr != nil {
+					problems = append(problems, fmt.Sprintf("invalid %s path: %v", label, otherErr))
+					continue
+				}
+				if other != "" && other == baselinePath {
+					problems = append(problems, fmt.Sprintf("-monitor-baseline-output must be distinct from %s", label))
+				}
+			}
+			statePath, stateErr := canonicalOptionPath(o.StateDir)
+			if stateErr != nil {
+				problems = append(problems, fmt.Sprintf("invalid state directory: %v", stateErr))
+			} else if optionPathWithin(statePath, baselinePath) {
+				problems = append(problems, "-monitor-baseline-output must be outside -state-dir")
 			}
 		}
 	}
@@ -218,7 +265,7 @@ func printFlags() {
 	fmt.Fprintln(w, "\nTARGET:\n  -d, -domain string[]        target domain(s)\n  -df string                  file containing target domains")
 	fmt.Fprintln(w, "\nLOG SELECTION:\n  -lu, -log-url string[]      explicit RFC6962 log URL(s)\n  -ls, -list-logs             list RFC6962 + Static CT logs\n  -log-state string           trusted=usable+qualified+readonly (default: trusted)\n  -log-list-output string     persist exact auto-discovery log-list bytes")
 	fmt.Fprintln(w, "\nSCRAPING:\n  -w, -workers int            concurrent fetch workers (default: 4)\n  -pw, -parse-workers int     concurrent parse workers, 0=auto\n  -bs, -batch-size int        entries per range request (default: 256)\n  -rl, -rate-limit int        max requests/sec, 0=unlimited\n  -to, -timeout int           HTTP timeout seconds (default: 30)\n  -retries int                retries per failed request (default: 3)\n  -start int                  start entry index\n  -n, -count int              entries to fetch, 0=all\n  -from-end                   start from newest entries")
-	fmt.Fprintln(w, "\nMONITOR:\n  -m, -monitor                continuous monitoring\n  -pi, -poll-interval int     seconds between polls")
+	fmt.Fprintln(w, "\nMONITOR:\n  -m, -monitor                continuous monitoring\n  -pi, -poll-interval int     seconds between polls\n  -monitor-baseline-output    persist newly initialized state before the first delta poll")
 	fmt.Fprintln(w, "\nOUTPUT:\n  -o, -output string          output file\n  -malformed-output string    malformed-entry evidence JSONL\n  -j, -json                   JSON lines\n  -f, -fields string          domains/ips/emails/certs/all\n  -s, -silent                 results only\n  -v, -verbose                debug output\n  -nc, -no-color              disable color")
 	fmt.Fprintln(w, "\nSTATE:\n  -resume                     resume from selection-bound contiguous position\n  -state-dir string           state directory")
 	fmt.Fprintln(w, "\nUPDATE:\n  -up, -update                disabled in fork build")
