@@ -34,6 +34,13 @@ func TestWriteMonitorBaselinePreservesInitializedState(t *testing.T) {
 	if got := info.Mode().Perm(); got != 0o600 {
 		t.Fatalf("mode = %o, want 600", got)
 	}
+	parentInfo, err := os.Stat(filepath.Dir(output))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := parentInfo.Mode().Perm(); got != 0o700 {
+		t.Fatalf("parent mode = %o, want 700", got)
+	}
 	var baseline monitorBaseline
 	data, err := os.ReadFile(output)
 	if err != nil {
@@ -111,5 +118,24 @@ func TestWriteMonitorBaselineRejectsEscapingStatePath(t *testing.T) {
 	selection := hex.EncodeToString(make([]byte, sha256.Size))
 	if err := writeMonitorBaseline(filepath.Join(root, "baseline.json"), stateDir, selection, []string{outside}); err == nil {
 		t.Fatal("expected escaping-state error")
+	}
+}
+
+func TestWriteMonitorBaselineRejectsNonPrivateState(t *testing.T) {
+	if os.PathSeparator == '\\' {
+		t.Skip("POSIX permission semantics required")
+	}
+	root := t.TempDir()
+	stateDir := filepath.Join(root, "state")
+	if err := os.MkdirAll(stateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	statePath := filepath.Join(stateDir, "monitor-abc.json")
+	if err := os.WriteFile(statePath, []byte("{}"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	selection := hex.EncodeToString(make([]byte, sha256.Size))
+	if err := writeMonitorBaseline(filepath.Join(root, "baseline.json"), stateDir, selection, []string{statePath}); err == nil {
+		t.Fatal("expected non-private state error")
 	}
 }
